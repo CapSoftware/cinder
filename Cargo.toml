@@ -1,0 +1,19 @@
+[package]
+name = "cinder"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A Cargo-compatible development accelerator"
+license = "MIT"
+repository = "https://github.com/capsoftware/cinder"
+keywords = ["build", "cargo", "development", "performance"]
+categories = ["development-tools::build-utils"]
+
+[dependencies]
+aho-corasick = "1"
+memmap2 = "0.9"
+sha2 = "0.10"
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
