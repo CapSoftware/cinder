@@ -30,6 +30,8 @@ The current prototype has been measured on real Rust desktop applications on
 Apple Silicon. Times are median wall-clock durations with a warm target cache.
 Each row measures a complete development outcome, not just compiler time.
 
+The original executable-patching path produced these results:
+
 | Scenario | Trials per phase | Cargo | Cinder | Result |
 | --- | ---: | ---: | ---: | ---: |
 | [Cap](https://github.com/CapSoftware/Cap) desktop, warm edit to stable visible window | 7 | 12.387s | 5.088s | **2.43x faster** (59.0% less time) |
@@ -57,12 +59,36 @@ These are prototype measurements, not a claim that every Rust edit is 2.43x to
 6.41x faster. The rows exercise Cinder's current narrow fast path; unsupported
 edits still use Cargo.
 
+Cinder now also retains a bounded history of exact Cargo-built revisions. The
+following trials alternated between two real source states after both had been
+built and validated once. They measure undo/redo, branch switching, and hot
+reload returning to a recent revision; they do not claim to accelerate a
+first-seen structural edit.
+
+| Repository and real change | Trials | Cargo | Cinder | Result |
+| --- | ---: | ---: | ---: | ---: |
+| [Cap](https://github.com/CapSoftware/Cap), 97-line desktop refactor, `build -p cap-desktop --bin cap-desktop` | 7 | 18.79s | 0.49s | **38.3x faster** (97.4% less time) |
+| [Handy](https://github.com/cjpais/Handy), 18-line Tauri change | 7 | 3.17s | 0.23s | **13.8x faster** (92.7% less time) |
+| [Zed](https://github.com/zed-industries/zed), four-file Git/protobuf change, `build -p collab --bin collab` | 7 | 19.68s | 0.40s | **49.2x faster** (98.0% less time) |
+| [Zed](https://github.com/zed-industries/zed), the same change, `run -p collab --bin collab -- version` | 7 | 18.59s | 0.14s | **132.8x faster** (99.2% less time) |
+| [Bun](https://github.com/oven-sh/bun), 489-line XML change, `build -p bun_bin` producing `libbun_rust.a` | 7 | 10.68s | 0.08s | **133.5x faster** (99.3% less time) |
+
+Each Cinder trial required an explicit history-hit marker. Executables passed
+strict code-signature verification. Bun's static archive was opened with
+`ar`, and its SHA-256 digest was checked against the requested source revision
+on every trial. All benchmark source trees were restored to their exact Git
+state afterward.
+
 ## What Cinder accelerates today
 
-The current fast path supports macOS development `run` commands and
-single-executable `build` commands. It recognizes one equal-byte-length UTF-8
-edit in one project Rust source file when the edited data is both unambiguous
-and unique in the compiled executable.
+The current macOS development fast path has two layers:
+
+- a direct executable transformation for one equal-byte-length UTF-8 edit when
+  the edited bytes are unambiguous and unique in the compiled executable;
+- exact restoration of a recently validated Cargo-built revision, including
+  structural and multi-file changes, for `run` executables and `build`
+  commands that produce one unambiguous primary artifact. Static-library
+  restoration is covered end to end.
 
 Eligible data currently includes:
 
@@ -72,9 +98,9 @@ Eligible data currently includes:
 - sources discovered through Cargo dep-info, including nested workspace
   packages and custom module layouts.
 
-After a normal Cargo build, Cinder records the selected executable and prepares
-its source index outside the command's critical path. On the next eligible edit
-it:
+After a normal Cargo build, Cinder records the selected artifact and prepares
+its source/input state outside the command's critical path. On the next
+eligible executable edit it:
 
 1. verifies the Cargo invocation, environment, artifact, manifests, lockfile,
    configuration, dep-info, project sources, and build-script inputs;
@@ -89,6 +115,31 @@ it:
 artifact path, but preserves its previous modification time. The edited source
 therefore remains newer, so a later real Cargo command still recompiles it. An
 unchanged recorded executable build can also be reused without invoking Cargo.
+When patching an ad-hoc signed executable, Cinder preserves and verifies its
+identifier, entitlements, requirements, hardened-runtime flags, and launch and
+library constraints. A non-ad-hoc signing identity falls back to Cargo because
+Cinder does not assume access to its private key.
+
+For revision restoration, Cinder validates source contents, manifests,
+configuration, toolchain identity, build-script inputs, environment context,
+and a digest-bound immutable artifact receipt before publishing the prior
+public artifact. Cached artifacts are content-hashed when published, made
+read-only, and then checked by their full filesystem identity on reuse; source
+sets are content-hashed once per history lookup. Manifests, configuration, and
+other control inputs retain both a content digest and full filesystem identity,
+so same-size replacements with preserved modification times still invalidate.
+Cinder deliberately does not fabricate Cargo's hashed outputs or fingerprints,
+so the next ordinary Cargo build refreshes its own complete output set. Current
+no-change reuse is allowed only while the exact recorded hashed artifact,
+dep-info, and fingerprint directory still exist.
+
+Retained history is bounded to eight revisions per project and command kind,
+with a global 4 GiB logical-byte and 30-day limit over its artifacts, source
+snapshots, state, and restored run siblings. The one active run state and one
+active build state per workspace are outside that history budget, as are
+ordinary Cargo outputs. Staging left by a terminated process is age-pruned
+without touching live publishers. Deleted workspaces, expired entries, and
+orphaned or superseded fast-run siblings are pruned.
 
 Existing `RUSTC_WRAPPER` tools are chained during artifact capture rather than
 replaced. Watcher-driven workflows can opt into duplicate file-event
@@ -103,13 +154,14 @@ exit status intact. `check` and `test` currently always use Cargo.
 
 The fast path is rejected for cases including:
 
-- structural Rust changes, different-length strings, escaped or raw strings,
-  ambiguous data, and changes across multiple source files;
+- first-seen structural Rust changes, different-length strings that are not an
+  exact retained revision, escaped or raw strings, and ambiguous data;
 - changed features, environment, manifests, lockfiles, Cargo configuration,
-  build-script inputs, compiler context, or other project Rust inputs;
+  build-script inputs, compiler context, or other project Rust inputs that do
+  not match a retained validated state;
 - release or custom profiles, custom targets or runners, command-line Cargo
   configuration, examples, tests, benches, multiple executables, and
-  library-only builds;
+  explicit multi-target/library selectors;
 - missing reproducibility inputs, stale state, unsupported artifacts, and
   non-macOS targets.
 
@@ -123,16 +175,22 @@ scripts, proc macros, toolchain selection, or the workspace graph. Cargo still
 performs every reference build and remains authoritative for those contracts.
 
 Accelerated state is stored in owner-only temporary directories. It contains a
-SHA-256 digest of the invocation and environment rather than raw environment
-values, source snapshots, public Cargo dep-info, artifact metadata, and the
-inputs needed to invalidate the fast path. Artifact publication is staged,
-signed, and atomic. Malformed, stale, incomplete, or ambiguous state falls back
+SHA-256 digest of the invocation and build-relevant environment rather than raw
+environment values, content-addressed source/input state, exact Cargo output
+paths, artifact metadata and digest, and the inputs needed to invalidate the
+fast path. Volatile shell `_` is omitted unless the selected Cargo unit graph's
+compiler dep-info or build-script output reports that it was observed, avoiding
+false hot-path misses without making `env!("_")` or `rerun-if-env-changed=_`
+stale. Artifact publication is staged and atomic; executable publication is
+also ad-hoc signed. Malformed, stale, incomplete, or ambiguous state falls back
 to Cargo.
 
-Integration tests compare transformed binaries with normal Cargo output and
-cover standalone packages, virtual workspaces, linked library targets,
-build-script invalidation, compiler-wrapper chaining, runtime linker state,
-Cargo freshness after a build patch, and unsupported-edit fallback.
+Integration tests compare transformed artifacts with normal Cargo output and
+cover standalone packages, virtual workspaces, linked library targets, static
+libraries, revision replay, build-script content changes, new auto targets,
+Cargo-home configuration, compiler identity, wrapper chaining, runtime linker
+state, Cargo clean/partial-clean behavior, target locking, cache pruning, Cargo
+freshness after a build patch, and unsupported-edit fallback.
 
 For the full safety boundary, see [the architecture notes](docs/architecture.md).
 
