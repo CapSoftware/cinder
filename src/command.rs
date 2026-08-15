@@ -15,35 +15,54 @@ pub fn run_cargo(
     arguments: Vec<OsString>,
     launch_policy: crate::run::LaunchPolicy,
 ) -> Result<u8, String> {
-    let cargo = cargo_executable();
+    let cargo = cargo_executable()?;
     reject_recursive_delegate(&cargo)?;
-    let run_context = crate::run::run_context(&arguments, launch_policy);
-    match arguments.first().and_then(|argument| argument.to_str()) {
-        Some("run") => {
+    let run_context =
+        crate::run::run_context_with_cargo(&arguments, launch_policy, cargo.as_os_str());
+    let subcommand = crate::run::cargo_subcommand(&arguments);
+    match subcommand {
+        Some("run" | "r") => {
             if let Err(error) = crate::run::try_fast_run(&arguments, &run_context, launch_policy) {
                 eprintln!("cinder: fast run unavailable ({error}); using Cargo");
             }
         }
-        Some("build") => match crate::run::try_fast_build(&arguments, &run_context) {
+        Some("build" | "b") => match crate::run::try_fast_build(&arguments, &run_context) {
             Ok(true) => return Ok(0),
             Ok(false) => {}
             Err(error) => eprintln!("cinder: fast build unavailable ({error}); using Cargo"),
         },
+        Some("check" | "c") => match crate::run::try_fast_check(&arguments, &run_context) {
+            Ok(true) => return Ok(0),
+            Ok(false) => {}
+            Err(error) => eprintln!("cinder: fast check unavailable ({error}); using Cargo"),
+        },
+        Some("test" | "t") => match crate::run::try_fast_test(&arguments, &run_context) {
+            Ok(true) => return Ok(0),
+            Ok(false) => {}
+            Err(error) => eprintln!("cinder: fast test unavailable ({error}); using Cargo"),
+        },
         _ => {}
     }
-    let context_path = (arguments.first().and_then(|value| value.to_str()) == Some("run"))
+    let context_path = matches!(subcommand, Some("run" | "r"))
         .then(|| crate::run::stage_run_context(&run_context))
         .transpose()?;
     let receipt_directory = crate::run::artifact_capture_eligible(&arguments)?
         .then(crate::run::stage_artifact_receipts)
         .transpose()?;
-    let captures_build = arguments.first().and_then(|value| value.to_str()) == Some("build")
-        && receipt_directory.is_some();
-    let selects_binary = arguments.iter().any(|argument| {
-        argument
-            .to_str()
-            .is_some_and(|argument| argument == "--bin" || argument.starts_with("--bin="))
-    });
+    let captures_build = matches!(subcommand, Some("build" | "b")) && receipt_directory.is_some();
+    let captures_check = matches!(subcommand, Some("check" | "c")) && receipt_directory.is_some();
+    let captures_test = matches!(subcommand, Some("test" | "t")) && receipt_directory.is_some();
+    let cleans_project = subcommand == Some("clean");
+    let selects_executable = arguments
+        .iter()
+        .take_while(|argument| argument.as_os_str() != "--")
+        .any(|argument| {
+            argument.to_str().is_some_and(|argument| {
+                ["--bin", "--example", "--test"]
+                    .iter()
+                    .any(|flag| argument == *flag || argument.starts_with(&format!("{flag}=")))
+            })
+        });
     let arguments = crate::run::cargo_arguments(arguments)?;
 
     if captures_build {
@@ -57,13 +76,77 @@ pub fn run_cargo(
             .status()
             .map_err(|error| format!("could not execute {}: {error}", cargo.display()))?;
         if status.success() {
-            crate::run::schedule_completed_build(receipt_directory, &run_context, selects_binary)
-                .unwrap_or_else(|error| {
-                    eprintln!("cinder: could not prepare the next fast build: {error}")
-                });
+            crate::run::schedule_completed_build(
+                receipt_directory,
+                &run_context,
+                selects_executable,
+            )
+            .unwrap_or_else(|error| {
+                eprintln!("cinder: could not prepare the next fast build: {error}")
+            });
         }
         if !status.success() {
             let _ = std::fs::remove_dir_all(receipt_directory);
+        }
+        return Ok(exit_code(status));
+    }
+
+    if captures_check {
+        let receipt_directory = receipt_directory
+            .as_deref()
+            .ok_or_else(|| "check receipt directory was not staged".to_owned())?;
+        let mut command = Command::new(&cargo);
+        command.args(arguments);
+        configure_rustc_wrapper(&mut command, receipt_directory)?;
+        let status = command
+            .status()
+            .map_err(|error| format!("could not execute {}: {error}", cargo.display()))?;
+        if status.success() {
+            crate::run::schedule_completed_check(
+                receipt_directory,
+                &run_context,
+                selects_executable,
+            )
+            .unwrap_or_else(|error| {
+                eprintln!("cinder: could not prepare the next fast check: {error}")
+            });
+        }
+        if !status.success() {
+            let _ = std::fs::remove_dir_all(receipt_directory);
+        }
+        return Ok(exit_code(status));
+    }
+
+    if captures_test {
+        let receipt_directory = receipt_directory
+            .as_deref()
+            .ok_or_else(|| "test receipt directory was not staged".to_owned())?;
+        let mut command = Command::new(&cargo);
+        command.args(arguments);
+        configure_rustc_wrapper(&mut command, receipt_directory)?;
+        let status = command
+            .status()
+            .map_err(|error| format!("could not execute {}: {error}", cargo.display()))?;
+        if status.success() {
+            crate::run::schedule_completed_test(receipt_directory, &run_context).unwrap_or_else(
+                |error| eprintln!("cinder: could not prepare the next fast test: {error}"),
+            );
+        }
+        if !status.success() {
+            let _ = std::fs::remove_dir_all(receipt_directory);
+        }
+        return Ok(exit_code(status));
+    }
+
+    if cleans_project {
+        let status = Command::new(&cargo)
+            .args(&arguments)
+            .status()
+            .map_err(|error| format!("could not execute {}: {error}", cargo.display()))?;
+        if status.success() {
+            crate::run::clear_project_state(&arguments).unwrap_or_else(|error| {
+                eprintln!("cinder: Cargo cleaned successfully, but Cinder state remains: {error}");
+            });
         }
         return Ok(exit_code(status));
     }
@@ -273,10 +356,106 @@ fn rustc_crate_name(arguments: &[OsString]) -> Option<&std::ffi::OsStr> {
         .map(|pair| pair[1].as_os_str())
 }
 
-fn cargo_executable() -> PathBuf {
-    env::var_os("CINDER_REAL_CARGO")
-        .filter(|value| !value.is_empty())
-        .map_or_else(|| PathBuf::from("cargo"), PathBuf::from)
+fn cargo_executable() -> Result<PathBuf, String> {
+    if let Some(configured) = env::var_os("CINDER_REAL_CARGO").filter(|value| !value.is_empty()) {
+        let configured_path = PathBuf::from(&configured);
+        if configured_path.components().count() > 1 {
+            return Ok(configured_path);
+        }
+        return path_executable(&configured, false).ok_or_else(|| {
+            format!(
+                "CINDER_REAL_CARGO could not be found on PATH: {}",
+                configured_path.display()
+            )
+        });
+    }
+
+    path_executable("cargo".as_ref(), true).ok_or_else(|| {
+        "could not find the real Cargo executable after Cinder on PATH; set CINDER_REAL_CARGO explicitly"
+            .to_owned()
+    })
+}
+
+fn path_executable(program: &std::ffi::OsStr, skip_current: bool) -> Option<PathBuf> {
+    let search_path = env::var_os("PATH")?;
+    let current = env::current_exe().ok();
+    env::split_paths(&search_path)
+        .flat_map(|directory| executable_candidates(&directory, program))
+        .find(|candidate| {
+            executable_file(candidate)
+                && (!skip_current
+                    || current
+                        .as_deref()
+                        .is_none_or(|current| !same_file(candidate, current)))
+        })
+}
+
+#[cfg(not(windows))]
+fn executable_candidates(directory: &Path, program: &std::ffi::OsStr) -> Vec<PathBuf> {
+    vec![absolute_search_directory(directory).join(program)]
+}
+
+#[cfg(windows)]
+fn executable_candidates(directory: &Path, program: &std::ffi::OsStr) -> Vec<PathBuf> {
+    let directory = absolute_search_directory(directory);
+    let program_path = Path::new(program);
+    if program_path.extension().is_some() {
+        return vec![directory.join(program)];
+    }
+    let extensions = env::var_os("PATHEXT").unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into());
+    extensions
+        .to_string_lossy()
+        .split(';')
+        .filter(|extension| !extension.is_empty())
+        .map(|extension| {
+            let mut name = program.to_os_string();
+            name.push(extension.to_ascii_lowercase());
+            directory.join(name)
+        })
+        .collect()
+}
+
+fn absolute_search_directory(directory: &Path) -> PathBuf {
+    if directory.as_os_str().is_empty() {
+        env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    } else if directory.is_absolute() {
+        directory.to_owned()
+    } else {
+        env::current_dir()
+            .map(|current| current.join(directory))
+            .unwrap_or_else(|_| directory.to_owned())
+    }
+}
+
+#[cfg(unix)]
+fn executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(windows)]
+fn executable_file(path: &Path) -> bool {
+    path.is_file()
+}
+
+#[cfg(unix)]
+fn same_file(left: &Path, right: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(left) = std::fs::metadata(left) else {
+        return false;
+    };
+    let Ok(right) = std::fs::metadata(right) else {
+        return false;
+    };
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(windows)]
+fn same_file(left: &Path, right: &Path) -> bool {
+    std::fs::canonicalize(left).ok() == std::fs::canonicalize(right).ok()
 }
 
 fn reject_recursive_delegate(cargo: &Path) -> Result<(), String> {
@@ -289,7 +468,7 @@ fn reject_recursive_delegate(cargo: &Path) -> Result<(), String> {
 
     if cargo_path == current {
         return Err(
-            "CINDER_REAL_CARGO resolves to Cinder itself; point it at the real Cargo executable"
+            "the selected Cargo executable resolves to Cinder itself; point CINDER_REAL_CARGO at the real Cargo executable"
                 .to_owned(),
         );
     }
