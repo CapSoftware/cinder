@@ -40,6 +40,91 @@ fn forwards_arguments_environment_and_exit_status_to_cargo() {
     fs::remove_dir_all(directory).unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn cargo_shim_finds_the_next_real_cargo_on_path() {
+    use std::{
+        fs,
+        os::unix::fs::{PermissionsExt, symlink},
+        process::Command,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let directory =
+        std::env::temp_dir().join(format!("cinder-cargo-shim-{}-{unique}", std::process::id()));
+    let shim_directory = directory.join("shim");
+    let real_directory = directory.join("real");
+    fs::create_dir_all(&shim_directory).unwrap();
+    fs::create_dir_all(&real_directory).unwrap();
+    let shim = shim_directory.join("cargo");
+    symlink(env!("CARGO_BIN_EXE_cinder"), &shim).unwrap();
+    let real_cargo = real_directory.join("cargo");
+    fs::write(
+        &real_cargo,
+        "#!/bin/sh\nprintf 'real-cargo arg=<%s> probe=<%s>\\n' \"$1\" \"$CINDER_TEST_PROBE\"\nexit 29\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&real_cargo).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&real_cargo, permissions).unwrap();
+
+    let search_path = std::env::join_paths([&shim_directory, &real_directory]).unwrap();
+    let output = Command::new(&shim)
+        .env("PATH", search_path)
+        .env_remove("CINDER_REAL_CARGO")
+        .env("CINDER_TEST_PROBE", "preserved")
+        .arg("check")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(29));
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "real-cargo arg=<check> probe=<preserved>\n"
+    );
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn cargo_shim_rejects_a_bare_override_that_resolves_to_itself() {
+    use std::{
+        fs,
+        os::unix::fs::symlink,
+        process::Command,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let directory =
+        std::env::temp_dir().join(format!("cinder-cargo-loop-{}-{unique}", std::process::id()));
+    fs::create_dir(&directory).unwrap();
+    let shim = directory.join("cargo");
+    symlink(env!("CARGO_BIN_EXE_cinder"), &shim).unwrap();
+
+    let output = Command::new(&shim)
+        .env("PATH", &directory)
+        .env("CINDER_REAL_CARGO", "cargo")
+        .arg("--version")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("resolves to Cinder itself")
+    );
+    fs::remove_dir_all(directory).unwrap();
+}
+
 #[test]
 fn prints_cinder_help_without_starting_cargo() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_cinder"))
