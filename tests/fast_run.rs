@@ -3,9 +3,10 @@
 use fs2::FileExt;
 use std::{
     collections::hash_map::DefaultHasher,
+    ffi::{OsStr, OsString},
     fs,
     hash::{Hash, Hasher},
-    os::unix::fs::PermissionsExt,
+    os::unix::{ffi::OsStringExt, fs::PermissionsExt},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     sync::atomic::{AtomicU64, Ordering},
@@ -14,6 +15,39 @@ use std::{
 };
 
 static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
+
+#[test]
+fn direct_no_change_runs_keep_reusing_the_validated_immutable_artifact() {
+    let fixture = Fixture::new();
+    fixture.write_structural_source(2);
+
+    let initial = fixture.run("direct");
+    assert_success(&initial);
+    assert_eq!(stdout(&initial), "15");
+
+    let restored = fixture.run("direct");
+    assert_success(&restored);
+    assert_eq!(stdout(&restored), "15");
+    assert!(stderr(&restored).contains("Cinder restored"));
+    assert!(
+        !fixture
+            .state_directory()
+            .join("run/duplicate-ready")
+            .exists()
+    );
+
+    for _ in 0..2 {
+        let reused = fixture.run("direct");
+        assert_success(&reused);
+        assert_eq!(stdout(&reused), "15");
+        assert!(
+            stderr(&reused).contains("Cinder reusing"),
+            "direct no-change run did not reuse its immutable artifact:\n{}",
+            stderr(&reused)
+        );
+        assert!(!stderr(&reused).contains("Cinder restored"));
+    }
+}
 
 #[test]
 fn patches_unique_string_data_and_falls_back_for_context_changes() {
@@ -192,6 +226,25 @@ fn restores_a_previous_structural_build_without_invoking_cargo() {
 }
 
 #[test]
+fn cargo_build_alias_restores_a_previous_revision() {
+    let fixture = Fixture::new();
+    fixture.write_structural_source(2);
+    assert_success(&fixture.build_alias());
+    fixture.write_structural_source(3);
+    assert_success(&fixture.build_alias());
+    fixture.write_structural_source(2);
+
+    let restored = fixture.build_alias();
+    assert_success(&restored);
+    assert!(
+        stderr(&restored).contains("Cinder restored a validated previous build"),
+        "cargo b did not use build history:\n{}",
+        stderr(&restored)
+    );
+    assert_eq!(fixture.built_stdout(), "15");
+}
+
+#[test]
 fn restores_a_previous_static_library_build_without_invoking_cargo() {
     let fixture = Fixture::new_static_library();
     fixture.write_static_library_source(2);
@@ -236,6 +289,50 @@ fn multiple_library_crate_types_stay_on_cargo() {
         stderr(&rebuilt)
     );
     assert!(!stderr(&rebuilt).contains("Cinder restored"));
+}
+
+#[test]
+fn restores_a_selected_library_build_without_invoking_cargo() {
+    let fixture = Fixture::new_static_library();
+    fixture.write_static_library_source(2);
+    assert_success(&fixture.build_selected_lib());
+    let first = fs::read(fixture.static_library_artifact()).unwrap();
+
+    fixture.write_static_library_source(3);
+    assert_success(&fixture.build_selected_lib());
+    assert_ne!(fs::read(fixture.static_library_artifact()).unwrap(), first);
+
+    fixture.write_static_library_source(2);
+    let restored = fixture.build_selected_lib();
+    assert_success(&restored);
+    assert!(
+        stderr(&restored).contains("Cinder restored a validated previous build"),
+        "selected library revision did not use Cinder history:\n{}",
+        stderr(&restored)
+    );
+    assert_eq!(fs::read(fixture.static_library_artifact()).unwrap(), first);
+}
+
+#[test]
+fn restores_a_selected_example_build_without_invoking_cargo() {
+    let fixture = Fixture::new_example();
+    fixture.write_structural_source(2);
+    assert_success(&fixture.build_selected_example());
+    assert_eq!(fixture.built_example_stdout(), "15");
+
+    fixture.write_structural_source(3);
+    assert_success(&fixture.build_selected_example());
+    assert_eq!(fixture.built_example_stdout(), "22");
+
+    fixture.write_structural_source(2);
+    let restored = fixture.build_selected_example();
+    assert_success(&restored);
+    assert!(
+        stderr(&restored).contains("Cinder restored a validated previous build"),
+        "selected example revision did not use Cinder history:\n{}",
+        stderr(&restored)
+    );
+    assert_eq!(fixture.built_example_stdout(), "15");
 }
 
 #[test]
@@ -483,6 +580,27 @@ fn restores_a_previous_structural_run_without_invoking_cargo() {
 }
 
 #[test]
+fn cargo_run_alias_restores_a_previous_revision() {
+    let fixture = Fixture::new();
+    fixture.write_structural_source(2);
+    let initial = fixture.run_alias();
+    assert_success(&initial);
+    assert_eq!(stdout(&initial), "15");
+    fixture.write_structural_source(3);
+    assert_success(&fixture.run_alias());
+    fixture.write_structural_source(2);
+
+    let restored = fixture.run_alias();
+    assert_success(&restored);
+    assert!(
+        stderr(&restored).contains("Cinder restored a validated previous build"),
+        "cargo r did not use run history:\n{}",
+        stderr(&restored)
+    );
+    assert_eq!(stdout(&restored), "15");
+}
+
+#[test]
 fn fast_build_waits_for_cargos_target_lock() {
     let fixture = Fixture::new();
     fixture.write_ordinary_source("one");
@@ -580,6 +698,510 @@ fn cargo_clean_invalidates_previous_structural_builds() {
                 .starts_with("cinder_fast_run_fixture-")),
         "Cargo's hashed package outputs were not rebuilt"
     );
+}
+
+#[test]
+fn cinder_clean_removes_project_state_and_fast_run_artifacts() {
+    let fixture = Fixture::new();
+    fixture.write_ordinary_source("one");
+    assert_success(&fixture.run("initial"));
+    fixture.write_ordinary_source("two");
+    let patched = fixture.run("initial");
+    assert_success(&patched);
+    assert!(stderr(&patched).contains("Cinder patched"));
+    assert!(fixture.state_directory().is_dir());
+    assert!(
+        fs::read_dir(fixture.root.join("target/debug"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".cinder-fast-"))
+    );
+
+    let cleaned = fixture.cinder_clean();
+    assert_success(&cleaned);
+    assert!(!fixture.state_directory().exists());
+    assert!(
+        fs::read_dir(fixture.root.join("target/debug"))
+            .map(|entries| entries.filter_map(Result::ok).all(|entry| !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".cinder-fast-")))
+            .unwrap_or(true),
+        "cinder clean left project-owned fast-run artifacts"
+    );
+}
+
+#[test]
+fn global_options_before_clean_still_remove_cinder_state() {
+    let fixture = Fixture::new();
+    fixture.write_ordinary_source("one");
+    assert_success(&fixture.run("initial"));
+    assert!(fixture.state_directory().is_dir());
+
+    let cleaned = fixture.cinder_clean_with_global_options();
+    assert_success(&cleaned);
+    assert!(!fixture.state_directory().exists());
+}
+
+#[test]
+fn global_change_directory_clean_removes_effective_project_state() {
+    let current = Fixture::new();
+    current.write_ordinary_source("current");
+    assert_success(&current.run("initial"));
+    let selected = Fixture::new();
+    selected.write_ordinary_source("selected");
+    assert_success(&selected.run("initial"));
+    assert!(current.state_directory().is_dir());
+    assert!(selected.state_directory().is_dir());
+
+    let fake_cargo = current.root.join("fake-cargo");
+    fs::write(&fake_cargo, "#!/bin/sh\nexit 0\n").unwrap();
+    let mut permissions = fs::metadata(&fake_cargo).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_cargo, permissions).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_cinder"))
+        .current_dir(&current.root)
+        .args([
+            OsString::from("-C"),
+            selected.root.as_os_str().to_owned(),
+            OsString::from("clean"),
+        ])
+        .env("CINDER_REAL_CARGO", &fake_cargo)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert!(current.state_directory().is_dir());
+    assert!(!selected.state_directory().exists());
+}
+
+#[test]
+fn reuses_an_unchanged_selected_binary_check() {
+    let fixture = Fixture::new();
+    fixture.write_structural_source(2);
+    let initial = fixture.check_selected_bin();
+    assert_success(&initial);
+    assert!(stderr(&initial).contains("Checking cinder-fast-run-fixture"));
+
+    let reused = fixture.check_selected_bin();
+    assert_success(&reused);
+    assert!(
+        stderr(&reused).contains("Cinder reused the validated check"),
+        "unchanged check did not use Cinder state:\n{}",
+        stderr(&reused)
+    );
+}
+
+#[test]
+fn cargo_check_alias_reuses_an_unchanged_selected_binary() {
+    let fixture = Fixture::new();
+    fixture.write_structural_source(2);
+    assert_success(&fixture.check_selected_bin_alias());
+
+    let reused = fixture.check_selected_bin_alias();
+    assert_success(&reused);
+    assert!(
+        stderr(&reused).contains("Cinder reused the validated check"),
+        "cargo c did not reuse validated check state:\n{}",
+        stderr(&reused)
+    );
+}
+
+#[test]
+fn changed_sources_and_missing_metadata_invalidate_fast_check() {
+    let fixture = Fixture::new();
+    fixture.write_structural_source(2);
+    assert_success(&fixture.check_selected_bin());
+    let reused = fixture.check_selected_bin();
+    assert_success(&reused);
+    assert!(stderr(&reused).contains("Cinder reused the validated check"));
+
+    fixture.write_structural_source(3);
+    let changed = fixture.check_selected_bin();
+    assert_success(&changed);
+    assert!(!stderr(&changed).contains("Cinder reused"));
+    assert!(stderr(&changed).contains("Checking cinder-fast-run-fixture"));
+
+    let artifact = PathBuf::from(OsString::from_vec(
+        fs::read(fixture.state_directory().join("check/artifact")).unwrap(),
+    ));
+    fs::remove_file(&artifact).unwrap();
+    let missing = fixture.check_selected_bin();
+    assert_success(&missing);
+    assert!(!stderr(&missing).contains("Cinder reused"));
+    assert!(stderr(&missing).contains("Checking cinder-fast-run-fixture"));
+}
+
+#[test]
+fn missing_linked_unit_fingerprint_invalidates_fast_check() {
+    let fixture = Fixture::new();
+    fixture.write_library_source("one");
+    assert_success(&fixture.check_selected_bin());
+    let reused = fixture.check_selected_bin();
+    assert_success(&reused);
+    assert!(stderr(&reused).contains("Cinder reused the validated check"));
+
+    let artifact = PathBuf::from(OsString::from_vec(
+        fs::read(fixture.state_directory().join("check/artifact")).unwrap(),
+    ));
+    let selected_hash = artifact
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .and_then(|name| name.rsplit_once('-').map(|(_, hash)| hash))
+        .unwrap();
+    let linked_fingerprint = fs::read_dir(fixture.root.join("target/debug/.fingerprint"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|name| {
+                    name.starts_with("cinder-fast-run-fixture-") && !name.ends_with(selected_hash)
+                })
+        })
+        .expect("missing linked library fingerprint");
+    fs::rename(
+        &linked_fingerprint,
+        fixture.root.join("held-linked-fingerprint"),
+    )
+    .unwrap();
+
+    let invalidated = fixture.check_selected_bin();
+    assert_success(&invalidated);
+    assert!(
+        !stderr(&invalidated).contains("Cinder reused"),
+        "a missing linked-unit fingerprint reused stale check state:\n{}",
+        stderr(&invalidated)
+    );
+    assert!(stderr(&invalidated).contains("Checking cinder-fast-run-fixture"));
+}
+
+#[test]
+fn newly_added_build_script_invalidates_fast_check() {
+    let fixture = Fixture::new();
+    fixture.write_build_script_probe_source();
+    assert_success(&fixture.check_selected_bin());
+    let reused = fixture.check_selected_bin();
+    assert_success(&reused);
+    assert!(stderr(&reused).contains("Cinder reused the validated check"));
+
+    fs::write(
+        fixture.root.join("build.rs"),
+        "fn main() { println!(\"cargo:rustc-env=CINDER_BUILD_SCRIPT_PROBE=present\"); }\n",
+    )
+    .unwrap();
+    let invalidated = fixture.check_selected_bin();
+    assert_success(&invalidated);
+    assert!(
+        !stderr(&invalidated).contains("Cinder reused"),
+        "a newly added build.rs reused stale check state:\n{}",
+        stderr(&invalidated)
+    );
+    assert!(
+        stderr(&invalidated).contains("Checking cinder-fast-run-fixture")
+            || stderr(&invalidated).contains("Compiling cinder-fast-run-fixture"),
+        "Cargo did not refresh the package after build.rs was added:\n{}",
+        stderr(&invalidated)
+    );
+}
+
+#[test]
+fn newly_added_cargo_home_config_invalidates_fast_check() {
+    let fixture = Fixture::new();
+    let cargo_home = fixture.root.join("cargo-home");
+    fs::create_dir_all(&cargo_home).unwrap();
+    fixture.write_cfg_probe_source();
+    assert_success(&fixture.check_selected_bin_with_cargo_home(&cargo_home));
+    let reused = fixture.check_selected_bin_with_cargo_home(&cargo_home);
+    assert_success(&reused);
+    assert!(stderr(&reused).contains("Cinder reused the validated check"));
+
+    fs::write(
+        cargo_home.join("config.toml"),
+        "[build]\nrustflags = [\"--cfg\", \"cinder_probe\"]\n",
+    )
+    .unwrap();
+    let invalidated = fixture.check_selected_bin_with_cargo_home(&cargo_home);
+    assert_success(&invalidated);
+    assert!(
+        !stderr(&invalidated).contains("Cinder reused"),
+        "new Cargo-home configuration reused stale check state:\n{}",
+        stderr(&invalidated)
+    );
+    assert!(stderr(&invalidated).contains("Checking cinder-fast-run-fixture"));
+}
+
+#[test]
+fn reuses_an_unchanged_named_integration_check() {
+    let fixture = Fixture::new();
+    fixture.write_integration_test_source("one");
+    let initial = fixture.check_selected_integration();
+    assert_success(&initial);
+    assert!(stderr(&initial).contains("Checking cinder-fast-run-fixture"));
+
+    let reused = fixture.check_selected_integration();
+    assert_success(&reused);
+    assert!(
+        stderr(&reused).contains("Cinder reused the validated check"),
+        "unchanged integration check did not use Cinder state:\n{}",
+        stderr(&reused)
+    );
+}
+
+#[test]
+fn multi_unit_check_stays_on_cargo() {
+    let fixture = Fixture::new();
+    fixture.write_library_source("one");
+    assert_success(&fixture.check_default());
+    assert!(!fixture.state_directory().join("check").exists());
+
+    let fresh = fixture.check_default();
+    assert_success(&fresh);
+    assert!(!stderr(&fresh).contains("Cinder reused"));
+    assert!(!fixture.state_directory().join("check").exists());
+}
+
+#[test]
+fn explicitly_selected_multi_unit_check_stays_on_cargo() {
+    let fixture = Fixture::new();
+    fixture.write_library_source("one");
+    let checked = fixture.check_selected_bin_and_lib();
+    assert_success(&checked);
+    assert!(!fixture.state_directory().join("check").exists());
+
+    let repeated = fixture.check_selected_bin_and_lib();
+    assert_success(&repeated);
+    assert!(!stderr(&repeated).contains("Cinder reused"));
+    assert!(!fixture.state_directory().join("check").exists());
+}
+
+#[test]
+fn combined_library_and_integration_checks_stay_on_cargo() {
+    let fixture = Fixture::new();
+    fixture.write_integration_test_source("one");
+    assert_success(&fixture.check_selected_lib_and_integration());
+    assert!(!fixture.state_directory().join("check").exists());
+
+    let repeated = fixture.check_selected_lib_and_integration();
+    assert_success(&repeated);
+    assert!(!stderr(&repeated).contains("Cinder reused"));
+    assert!(!fixture.state_directory().join("check").exists());
+}
+
+#[test]
+fn background_recorders_prepare_new_selected_check_and_test_targets() {
+    let test_fixture = Fixture::new();
+    test_fixture.write_library_source("one");
+    assert_success(&test_fixture.test_selected_lib_no_run_asynchronously());
+    test_fixture.wait_for_state("test");
+    let reused_test = test_fixture.test_selected_lib_no_run_asynchronously();
+    assert_success(&reused_test);
+    assert!(
+        stderr(&reused_test).contains("Cinder reused the validated test build"),
+        "background test recorder did not prepare reusable state:\n{}",
+        stderr(&reused_test)
+    );
+
+    let check_fixture = Fixture::new();
+    check_fixture.write_integration_test_source("one");
+    assert_success(&check_fixture.check_selected_integration_asynchronously());
+    check_fixture.wait_for_state("check");
+    let reused_check = check_fixture.check_selected_integration_asynchronously();
+    assert_success(&reused_check);
+    assert!(
+        stderr(&reused_check).contains("Cinder reused the validated check"),
+        "background check recorder did not prepare reusable state:\n{}",
+        stderr(&reused_check)
+    );
+}
+
+#[test]
+fn reuses_an_unchanged_selected_test_build() {
+    let fixture = Fixture::new_example();
+    fixture.write_structural_source(2);
+    let initial = fixture.test_selected_example_no_run("test");
+    assert_success(&initial);
+    assert!(stderr(&initial).contains("Compiling cinder-fast-run-fixture"));
+
+    let reused = fixture.test_selected_example_no_run("test");
+    assert_success(&reused);
+    assert!(
+        stderr(&reused).contains("Cinder reused the validated test build"),
+        "unchanged test --no-run did not use Cinder state:\n{}",
+        stderr(&reused)
+    );
+}
+
+#[test]
+fn reuses_an_unchanged_selected_library_test_build() {
+    let fixture = Fixture::new();
+    fixture.write_library_source("one");
+    let initial = fixture.test_selected_lib_no_run();
+    assert_success(&initial);
+    assert!(stderr(&initial).contains("Compiling cinder-fast-run-fixture"));
+
+    let reused = fixture.test_selected_lib_no_run();
+    assert_success(&reused);
+    assert!(
+        stderr(&reused).contains("Cinder reused the validated test build"),
+        "unchanged library test build did not use Cinder state:\n{}",
+        stderr(&reused)
+    );
+}
+
+#[test]
+fn reuses_an_unchanged_named_integration_test_build() {
+    let fixture = Fixture::new();
+    fixture.write_integration_test_source("one");
+    let initial = fixture.test_selected_integration_no_run();
+    assert_success(&initial);
+    assert!(stderr(&initial).contains("Compiling cinder-fast-run-fixture"));
+
+    let reused = fixture.test_selected_integration_no_run();
+    assert_success(&reused);
+    assert!(
+        stderr(&reused).contains("Cinder reused the validated test build"),
+        "unchanged integration test build did not use Cinder state:\n{}",
+        stderr(&reused)
+    );
+
+    fixture.write_integration_test_source("two");
+    let rebuilt = fixture.test_selected_integration_no_run();
+    assert_success(&rebuilt);
+    assert!(
+        !stderr(&rebuilt).contains("Cinder reused"),
+        "changed integration test inputs reused stale state:\n{}",
+        stderr(&rebuilt)
+    );
+    assert!(stderr(&rebuilt).contains("Compiling cinder-fast-run-fixture"));
+}
+
+#[test]
+fn combined_library_and_integration_test_builds_stay_on_cargo() {
+    let fixture = Fixture::new();
+    fixture.write_integration_test_source("one");
+    assert_success(&fixture.test_selected_lib_and_integration_no_run());
+    assert!(!fixture.state_directory().join("test").exists());
+
+    let repeated = fixture.test_selected_lib_and_integration_no_run();
+    assert_success(&repeated);
+    assert!(!stderr(&repeated).contains("Cinder reused"));
+    assert!(!fixture.state_directory().join("test").exists());
+}
+
+#[test]
+fn test_alias_reuses_an_unchanged_selected_test_build() {
+    let fixture = Fixture::new_example();
+    fixture.write_structural_source(2);
+    assert_success(&fixture.test_selected_example_no_run("t"));
+
+    let reused = fixture.test_selected_example_no_run("t");
+    assert_success(&reused);
+    assert!(
+        stderr(&reused).contains("Cinder reused the validated test build"),
+        "default build-script test state was not reused:\n{}",
+        stderr(&reused)
+    );
+}
+
+#[test]
+fn changed_sources_and_normal_test_execution_bypass_fast_test() {
+    let fixture = Fixture::new_example();
+    fixture.write_structural_source(2);
+    assert_success(&fixture.test_selected_example_no_run("test"));
+    assert_success(&fixture.test_selected_example_no_run("test"));
+
+    fixture.write_structural_source(3);
+    let changed = fixture.test_selected_example_no_run("test");
+    assert_success(&changed);
+    assert!(!stderr(&changed).contains("Cinder reused"));
+    assert!(stderr(&changed).contains("Compiling cinder-fast-run-fixture"));
+
+    let executed = fixture.test_selected_example();
+    assert_success(&executed);
+    assert!(!stderr(&executed).contains("Cinder reused"));
+    assert!(stdout(&executed).contains("test result: ok"));
+}
+
+#[test]
+fn default_build_script_package_inputs_invalidate_fast_test() {
+    let fixture = Fixture::new_example();
+    fixture.write_structural_source(2);
+    fixture.enable_default_build_script();
+    let initial = fixture.test_selected_example_no_run("test");
+    assert_success(&initial);
+    assert!(
+        fixture.state_directory().join("test").is_dir(),
+        "default build-script test state was not recorded:\n{}",
+        stderr(&initial)
+    );
+    let reused = fixture.test_selected_example_no_run("test");
+    assert_success(&reused);
+    assert!(
+        stderr(&reused).contains("Cinder reused the validated test build"),
+        "default build-script test state was not reused:\n{}",
+        stderr(&reused)
+    );
+
+    fs::write(fixture.root.join("build-asset.txt"), "changed\n").unwrap();
+    let invalidated = fixture.test_selected_example_no_run("test");
+    assert_success(&invalidated);
+    assert!(
+        !stderr(&invalidated).contains("Cinder reused"),
+        "default build-script package input reused stale test state:\n{}",
+        stderr(&invalidated)
+    );
+}
+
+#[test]
+fn multi_crate_type_test_dependencies_use_cargos_encoded_environment_data() {
+    let fixture = Fixture::new_multi_crate_type_binary();
+    assert_success(&fixture.test_selected_bin_no_run());
+    assert_eq!(
+        fs::read(fixture.state_directory().join("test/observes-underscore")).unwrap(),
+        b"1"
+    );
+
+    let reused = fixture.test_selected_bin_no_run();
+    assert_success(&reused);
+    assert!(
+        stderr(&reused).contains("Cinder reused the validated test build"),
+        "multi-crate-type test state was not reused:\n{}",
+        stderr(&reused)
+    );
+}
+
+#[test]
+fn encoded_dependency_environment_changes_invalidate_fast_test() {
+    let fixture = Fixture::new_multi_crate_type_binary();
+    assert_success(&fixture.test_selected_bin_no_run_with_shell_value("one"));
+
+    let changed = fixture.test_selected_bin_no_run_with_shell_value("two");
+    assert_success(&changed);
+    assert!(
+        !stderr(&changed).contains("Cinder reused"),
+        "encoded dependency environment change reused stale test state:\n{}",
+        stderr(&changed)
+    );
+    assert!(stderr(&changed).contains("Compiling cinder-fast-run-fixture"));
+}
+
+#[test]
+fn harness_arguments_cannot_turn_test_execution_into_no_run() {
+    let fixture = Fixture::new_harnessless_example();
+    fixture.write_structural_source(2);
+
+    for _ in 0..2 {
+        let executed = fixture.test_with_harness_no_run_argument();
+        assert_success(&executed);
+        assert_eq!(stdout(&executed), "15");
+        assert!(!stderr(&executed).contains("Cinder reused"));
+    }
+    assert!(!fixture.state_directory().join("test").exists());
 }
 
 #[test]
@@ -1183,6 +1805,25 @@ fn unselected_multi_artifact_builds_stay_on_cargo() {
 }
 
 #[test]
+fn explicitly_selected_multi_artifact_builds_stay_on_cargo() {
+    let fixture = Fixture::new();
+    fixture.write_library_source("one");
+    assert_success(&fixture.build_selected_bin_and_lib());
+    assert!(!fixture.state_directory().join("build").exists());
+
+    fixture.write_library_source("two");
+    let rebuilt = fixture.build_selected_bin_and_lib();
+    assert_success(&rebuilt);
+    assert!(
+        stderr(&rebuilt).contains("Compiling cinder-fast-run-fixture"),
+        "an explicitly selected bin-plus-lib build skipped Cargo:\n{}",
+        stderr(&rebuilt)
+    );
+    assert!(!stderr(&rebuilt).contains("Cinder patched"));
+    assert_eq!(fixture.built_stdout(), "library-two");
+}
+
+#[test]
 fn patches_run_strings_linked_from_the_packages_library_target() {
     let fixture = Fixture::new();
     fixture.write_library_source("one");
@@ -1330,8 +1971,51 @@ impl Fixture {
         Self::new_library_with_crate_types("\"staticlib\"")
     }
 
+    fn new_example() -> Self {
+        let mut fixture = Self::new();
+        let examples = fixture.root.join("examples");
+        fs::create_dir_all(&examples).unwrap();
+        fs::write(
+            fixture.root.join("src/lib.rs"),
+            "pub fn linked_value() -> i32 { 7 }\n",
+        )
+        .unwrap();
+        fixture.source = examples.join("demo.rs");
+        fixture
+    }
+
+    fn new_harnessless_example() -> Self {
+        let fixture = Self::new_example();
+        fs::write(
+            fixture.root.join("Cargo.toml"),
+            "[package]\nname = \"cinder-fast-run-fixture\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[[example]]\nname = \"demo\"\npath = \"examples/demo.rs\"\nharness = false\n",
+        )
+        .unwrap();
+        fixture
+    }
+
     fn new_multi_library() -> Self {
         Self::new_library_with_crate_types("\"rlib\", \"staticlib\"")
+    }
+
+    fn new_multi_crate_type_binary() -> Self {
+        let fixture = Self::new();
+        fs::write(
+            fixture.root.join("Cargo.toml"),
+            "[package]\nname = \"cinder-fast-run-fixture\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[lib]\ncrate-type = [\"rlib\", \"staticlib\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            &fixture.source,
+            "fn main() { println!(\"{}\", cinder_fast_run_fixture::value()); }\n",
+        )
+        .unwrap();
+        fs::write(
+            fixture.root.join("src/lib.rs"),
+            "pub fn value() -> &'static str { env!(\"_\") }\n",
+        )
+        .unwrap();
+        fixture
     }
 
     fn new_library_with_crate_types(crate_types: &str) -> Self {
@@ -1497,6 +2181,11 @@ impl Fixture {
         fs::write(self.root.join("build-input.txt"), "initial\n").unwrap();
     }
 
+    fn enable_default_build_script(&self) {
+        fs::write(self.root.join("build.rs"), "fn main() {}\n").unwrap();
+        fs::write(self.root.join("build-asset.txt"), "initial\n").unwrap();
+    }
+
     fn enable_value_build_script(&self, value: &str) {
         fs::write(
             &self.source,
@@ -1520,6 +2209,20 @@ impl Fixture {
         fs::write(
             self.root.join("src/lib.rs"),
             format!("pub fn value() -> &'static str {{ \"library-{value}\" }}\n"),
+        )
+        .unwrap();
+    }
+
+    fn write_integration_test_source(&self, value: &str) {
+        fs::write(
+            self.root.join("src/lib.rs"),
+            format!("pub fn value() -> &'static str {{ \"integration-{value}\" }}\n"),
+        )
+        .unwrap();
+        fs::create_dir_all(self.root.join("tests")).unwrap();
+        fs::write(
+            self.root.join("tests/smoke.rs"),
+            "#[test]\nfn smoke() { assert!(cinder_fast_run_fixture::value().starts_with(\"integration-\")); }\n",
         )
         .unwrap();
     }
@@ -1553,6 +2256,22 @@ impl Fixture {
         command.output().unwrap()
     }
 
+    fn run_alias(&self) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cinder"));
+        command.current_dir(&self.root).args(["r", "--quiet"]);
+        if let Some(package) = self.package {
+            command.args(["-p", package]);
+        }
+        command
+            .env("CINDER_REAL_CARGO", "cargo")
+            .env("CINDER_SYNCHRONOUS_STATE_RECORDING", "1")
+            .env("CARGO_TARGET_DIR", self.root.join("target"))
+            .env_remove("CINDER_DISABLE_FAST_RUN")
+            .env_remove("CINDER_RUN_CONTEXT_FILE")
+            .output()
+            .unwrap()
+    }
+
     fn run_with_environment(&self, context: &str, key: &str, value: &str) -> Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_cinder"));
         self.configure(&mut command, context);
@@ -1577,11 +2296,270 @@ impl Fixture {
         command.output().unwrap()
     }
 
+    fn build_alias(&self) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cinder"));
+        command.current_dir(&self.root).arg("b");
+        if let Some(package) = self.package {
+            command.args(["-p", package]);
+        }
+        command
+            .env("CINDER_REAL_CARGO", "cargo")
+            .env("CINDER_FIXTURE_VALUE", "build")
+            .env("CINDER_SYNCHRONOUS_STATE_RECORDING", "1")
+            .env("CARGO_TARGET_DIR", self.root.join("target"))
+            .env_remove("CINDER_DISABLE_FAST_BUILD")
+            .env_remove("CINDER_ARTIFACT_RECEIPT_DIRECTORY")
+            .env_remove("CINDER_RUSTC_WRAPPER_MODE")
+            .env_remove("CINDER_WRAPPER_ACTIVE")
+            .env_remove("CINDER_NEXT_RUSTC_WRAPPER")
+            .env_remove("CINDER_ORIGINAL_RUSTC_WRAPPER")
+            .output()
+            .unwrap()
+    }
+
     fn build_selected_bin(&self) -> Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_cinder"));
         self.configure_build(&mut command);
         command.args(["--bin", self.package.unwrap_or("cinder-fast-run-fixture")]);
         command.output().unwrap()
+    }
+
+    fn build_selected_bin_and_lib(&self) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cinder"));
+        self.configure_build(&mut command);
+        command.args([
+            "--bin",
+            self.package.unwrap_or("cinder-fast-run-fixture"),
+            "--lib",
+        ]);
+        command.output().unwrap()
+    }
+
+    fn build_selected_lib(&self) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cinder"));
+        self.configure_build(&mut command);
+        command.arg("--lib").output().unwrap()
+    }
+
+    fn build_selected_example(&self) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cinder"));
+        self.configure_build(&mut command);
+        command.args(["--example", "demo"]).output().unwrap()
+    }
+
+    fn check_selected_bin(&self) -> Output {
+        self.check_selected_bin_with_command("check")
+    }
+
+    fn check_selected_bin_alias(&self) -> Output {
+        self.check_selected_bin_with_command("c")
+    }
+
+    fn check_selected_bin_and_lib(&self) -> Output {
+        self.check_selected_targets(
+            "check",
+            &[
+                "--bin",
+                self.package.unwrap_or("cinder-fast-run-fixture"),
+                "--lib",
+            ],
+            None,
+        )
+    }
+
+    fn check_selected_bin_with_command(&self, command_name: &str) -> Output {
+        self.check_selected_targets(
+            command_name,
+            &["--bin", self.package.unwrap_or("cinder-fast-run-fixture")],
+            None,
+        )
+    }
+
+    fn check_selected_bin_with_cargo_home(&self, cargo_home: &Path) -> Output {
+        self.check_selected_targets(
+            "check",
+            &["--bin", self.package.unwrap_or("cinder-fast-run-fixture")],
+            Some(cargo_home),
+        )
+    }
+
+    fn check_selected_integration(&self) -> Output {
+        self.check_selected_targets("check", &["--test", "smoke"], None)
+    }
+
+    fn check_selected_integration_asynchronously(&self) -> Output {
+        self.check_selected_targets_with_recording("check", &["--test", "smoke"], None, false)
+    }
+
+    fn check_selected_lib_and_integration(&self) -> Output {
+        self.check_selected_targets("check", &["--lib", "--test", "smoke"], None)
+    }
+
+    fn check_selected_targets(
+        &self,
+        command_name: &str,
+        selectors: &[&str],
+        cargo_home: Option<&Path>,
+    ) -> Output {
+        self.check_selected_targets_with_recording(command_name, selectors, cargo_home, true)
+    }
+
+    fn check_selected_targets_with_recording(
+        &self,
+        command_name: &str,
+        selectors: &[&str],
+        cargo_home: Option<&Path>,
+        synchronous: bool,
+    ) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cinder"));
+        command
+            .current_dir(&self.root)
+            .arg(command_name)
+            .args(selectors);
+        command
+            .env("CINDER_REAL_CARGO", "cargo")
+            .env("CINDER_FIXTURE_VALUE", "check")
+            .env("CARGO_TARGET_DIR", self.root.join("target"))
+            .env_remove("CINDER_DISABLE_FAST_CHECK")
+            .env_remove("CINDER_ARTIFACT_RECEIPT_DIRECTORY")
+            .env_remove("CINDER_RUSTC_WRAPPER_MODE")
+            .env_remove("CINDER_WRAPPER_ACTIVE")
+            .env_remove("CINDER_NEXT_RUSTC_WRAPPER")
+            .env_remove("CINDER_ORIGINAL_RUSTC_WRAPPER");
+        if synchronous {
+            command.env("CINDER_SYNCHRONOUS_STATE_RECORDING", "1");
+        } else {
+            command.env_remove("CINDER_SYNCHRONOUS_STATE_RECORDING");
+        }
+        if let Some(cargo_home) = cargo_home {
+            command.env("CARGO_HOME", cargo_home);
+        }
+        command.output().unwrap()
+    }
+
+    fn check_default(&self) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cinder"));
+        command.current_dir(&self.root).arg("check");
+        command
+            .env("CINDER_REAL_CARGO", "cargo")
+            .env("CINDER_FIXTURE_VALUE", "check")
+            .env("CINDER_SYNCHRONOUS_STATE_RECORDING", "1")
+            .env("CARGO_TARGET_DIR", self.root.join("target"))
+            .env_remove("CINDER_DISABLE_FAST_CHECK")
+            .env_remove("CINDER_ARTIFACT_RECEIPT_DIRECTORY")
+            .env_remove("CINDER_RUSTC_WRAPPER_MODE")
+            .env_remove("CINDER_WRAPPER_ACTIVE")
+            .env_remove("CINDER_NEXT_RUSTC_WRAPPER")
+            .env_remove("CINDER_ORIGINAL_RUSTC_WRAPPER")
+            .output()
+            .unwrap()
+    }
+
+    fn test_selected_example_no_run(&self, command_name: &str) -> Output {
+        self.test_no_run_command(command_name, &["--example", "demo"], None)
+    }
+
+    fn test_selected_example(&self) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cinder"));
+        command
+            .current_dir(&self.root)
+            .args(["test", "--example", "demo"]);
+        command
+            .env("CINDER_REAL_CARGO", "cargo")
+            .env("CINDER_FIXTURE_VALUE", "test")
+            .env("CARGO_TARGET_DIR", self.root.join("target"))
+            .env_remove("CINDER_DISABLE_FAST_TEST")
+            .output()
+            .unwrap()
+    }
+
+    fn test_selected_bin_no_run(&self) -> Output {
+        self.test_selected_bin_no_run_command(None)
+    }
+
+    fn test_selected_bin_no_run_with_shell_value(&self, value: &str) -> Output {
+        self.test_selected_bin_no_run_command(Some(value))
+    }
+
+    fn test_selected_bin_no_run_command(&self, shell_value: Option<&str>) -> Output {
+        self.test_no_run_command(
+            "test",
+            &["--bin", self.package.unwrap_or("cinder-fast-run-fixture")],
+            shell_value,
+        )
+    }
+
+    fn test_selected_lib_no_run(&self) -> Output {
+        self.test_no_run_command("test", &["--lib"], None)
+    }
+
+    fn test_selected_lib_no_run_asynchronously(&self) -> Output {
+        self.test_no_run_command_with_recording("test", &["--lib"], None, false)
+    }
+
+    fn test_selected_integration_no_run(&self) -> Output {
+        self.test_no_run_command("test", &["--test", "smoke"], None)
+    }
+
+    fn test_selected_lib_and_integration_no_run(&self) -> Output {
+        self.test_no_run_command("test", &["--lib", "--test", "smoke"], None)
+    }
+
+    fn test_no_run_command(
+        &self,
+        command_name: &str,
+        selectors: &[&str],
+        shell_value: Option<&str>,
+    ) -> Output {
+        self.test_no_run_command_with_recording(command_name, selectors, shell_value, true)
+    }
+
+    fn test_no_run_command_with_recording(
+        &self,
+        command_name: &str,
+        selectors: &[&str],
+        shell_value: Option<&str>,
+        synchronous: bool,
+    ) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cinder"));
+        command
+            .current_dir(&self.root)
+            .args([command_name, "--no-run"])
+            .args(selectors);
+        command
+            .env("CINDER_REAL_CARGO", "cargo")
+            .env("CINDER_FIXTURE_VALUE", "test")
+            .env("CARGO_TARGET_DIR", self.root.join("target"))
+            .env_remove("CINDER_DISABLE_FAST_TEST")
+            .env_remove("CINDER_ARTIFACT_RECEIPT_DIRECTORY")
+            .env_remove("CINDER_RUSTC_WRAPPER_MODE")
+            .env_remove("CINDER_WRAPPER_ACTIVE")
+            .env_remove("CINDER_NEXT_RUSTC_WRAPPER")
+            .env_remove("CINDER_ORIGINAL_RUSTC_WRAPPER");
+        if synchronous {
+            command.env("CINDER_SYNCHRONOUS_STATE_RECORDING", "1");
+        } else {
+            command.env_remove("CINDER_SYNCHRONOUS_STATE_RECORDING");
+        }
+        if let Some(value) = shell_value {
+            command.env("_", value);
+        }
+        command.output().unwrap()
+    }
+
+    fn test_with_harness_no_run_argument(&self) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cinder"));
+        command
+            .current_dir(&self.root)
+            .args(["test", "--example", "demo", "--", "--no-run"]);
+        command
+            .env("CINDER_REAL_CARGO", "cargo")
+            .env("CINDER_FIXTURE_VALUE", "test")
+            .env("CINDER_SYNCHRONOUS_STATE_RECORDING", "1")
+            .env("CARGO_TARGET_DIR", self.root.join("target"))
+            .env_remove("CINDER_DISABLE_FAST_TEST")
+            .output()
+            .unwrap()
     }
 
     fn build_selected_bin_with_environment(&self, key: &str, value: &str) -> Output {
@@ -1659,6 +2637,30 @@ impl Fixture {
             .unwrap()
     }
 
+    fn cinder_clean(&self) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cinder"));
+        command.current_dir(&self.root).args(["clean", "-p"]);
+        command.arg(self.package.unwrap_or("cinder-fast-run-fixture"));
+        command
+            .env("CINDER_REAL_CARGO", "cargo")
+            .env("CARGO_TARGET_DIR", self.root.join("target"))
+            .output()
+            .unwrap()
+    }
+
+    fn cinder_clean_with_global_options(&self) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cinder"));
+        command
+            .current_dir(&self.root)
+            .args(["--locked", "clean", "-p"]);
+        command.arg(self.package.unwrap_or("cinder-fast-run-fixture"));
+        command
+            .env("CINDER_REAL_CARGO", "cargo")
+            .env("CARGO_TARGET_DIR", self.root.join("target"))
+            .output()
+            .unwrap()
+    }
+
     fn preserve_only_public_outputs_across_clean(&self) {
         let name = self.package.unwrap_or("cinder-fast-run-fixture");
         let profile = self.root.join("target/debug");
@@ -1676,6 +2678,14 @@ impl Fixture {
 
     fn built_stdout(&self) -> String {
         self.built_stdout_in_target(&self.root.join("target"))
+    }
+
+    fn built_example_stdout(&self) -> String {
+        let output = Command::new(self.root.join("target/debug/examples/demo"))
+            .output()
+            .unwrap();
+        assert_success(&output);
+        stdout(&output)
     }
 
     fn built_stdout_in_target(&self, target: &Path) -> String {
@@ -1774,6 +2784,17 @@ impl Fixture {
         std::env::temp_dir()
             .join("cinder/state")
             .join(format!("{:016x}", hasher.finish()))
+    }
+
+    fn wait_for_state(&self, kind: &str) {
+        let state = self.state_directory().join(kind).join("run-context");
+        for _ in 0..100 {
+            if state.is_file() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        panic!("background recorder did not publish {}", state.display());
     }
 
     fn configure(&self, command: &mut Command, context: &str) {
