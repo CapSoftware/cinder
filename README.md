@@ -18,6 +18,10 @@ root:
 ```bash
 cinder run -p my-app
 cinder build -p my-app
+cinder check -p my-app --bin my-app
+cinder test --no-run -p my-app --bin my-app
+cinder test --no-run -p my-library --lib
+cinder check -p my-library --test integration_name
 ```
 
 Cinder preserves the project's `Cargo.toml`, `Cargo.lock`, workspace, feature,
@@ -79,16 +83,30 @@ strict code-signature verification. Bun's static archive was opened with
 on every trial. All benchmark source trees were restored to their exact Git
 state afterward.
 
+Cinder's newer Cargo-parity paths have also been measured on exact no-change
+outputs. Selected `check` medians ranged from 8.6ms on Handy's Tauri package to
+62.3ms on Bun, versus Cargo medians from 106.4ms to 299.8ms. Selected
+`test --no-run` medians were 8.4ms to 37.4ms on Handy, Cap, and Zed, versus
+219.0ms to 387.1ms through Cargo. Explicit Bun library revision restoration
+was 0.11s versus 11.58s through Cargo. Commands, revisions, every sample,
+excluded failed attempts, and a reproduction harness are in the
+[Cargo parity benchmark notes](benchmarks/cargo-parity/README.md).
+
 ## What Cinder accelerates today
 
-The current macOS development fast path has two layers:
+The current macOS development fast path has three layers:
 
 - a direct executable transformation for one equal-byte-length UTF-8 edit when
   the edited bytes are unambiguous and unique in the compiled executable;
 - exact restoration of a recently validated Cargo-built revision, including
   structural and multi-file changes, for `run` executables and `build`
   commands that produce one unambiguous primary artifact. Static-library
-  restoration is covered end to end.
+  restoration and explicit single `--lib`/`--example` builds are covered end
+  to end;
+- exact no-change reuse for one unambiguous `check` unit and for
+  `test --no-run` with one explicitly selected bin, example, library, or named
+  integration test. These paths require Cargo's precise artifact, dep-info,
+  and fingerprint graph to remain present and never fabricate compiler state.
 
 Eligible data currently includes:
 
@@ -98,9 +116,9 @@ Eligible data currently includes:
 - sources discovered through Cargo dep-info, including nested workspace
   packages and custom module layouts.
 
-After a normal Cargo build, Cinder records the selected artifact and prepares
-its source/input state outside the command's critical path. On the next
-eligible executable edit it:
+After a normal Cargo build, check, or selected test build, Cinder records the
+selected artifact and prepares its source/input state outside the command's
+critical path. On the next eligible executable edit it:
 
 1. verifies the Cargo invocation, environment, artifact, manifests, lockfile,
    configuration, dep-info, project sources, and build-script inputs;
@@ -131,12 +149,25 @@ so same-size replacements with preserved modification times still invalidate.
 Cinder deliberately does not fabricate Cargo's hashed outputs or fingerprints,
 so the next ordinary Cargo build refreshes its own complete output set. Current
 no-change reuse is allowed only while the exact recorded hashed artifact,
-dep-info, and fingerprint directory still exist.
+dep-info, and every fingerprint directory in the selected Cargo unit graph
+still exist.
+
+After a direct no-change `cinder run` has restored or patched an immutable
+Cinder-owned artifact, later direct invocations reuse that same validated file
+without repeating the history promotion. Cinder does not apply this shortcut
+to Cargo's mutable public artifact; the first no-change launch after Cargo still
+uses the digest-bound immutable restoration path.
+
+For `check` and selected `test --no-run`, Cinder takes only that exact
+no-change path. A source, configuration, environment, build-script, topology,
+toolchain, or output change returns to Cargo. Normal `cargo test` always runs
+through Cargo so Cinder never suppresses test execution. Cargo's built-in
+`b`, `c`, `r`, and `t` aliases share the same eligibility rules.
 
 Retained history is bounded to eight revisions per project and command kind,
 with a global 4 GiB logical-byte and 30-day limit over its artifacts, source
-snapshots, state, and restored run siblings. The one active run state and one
-active build state per workspace are outside that history budget, as are
+snapshots, state, and restored run siblings. The active run, build, check, and
+selected-test state for each workspace is outside that history budget, as are
 ordinary Cargo outputs. Staging left by a terminated process is age-pruned
 without touching live publishers. Deleted workspaces, expired entries, and
 orphaned or superseded fast-run siblings are pruned.
@@ -150,7 +181,11 @@ enables that launch policy automatically.
 
 Cargo remains the compatibility floor. Cinder delegates unknown commands and
 unsupported optimization cases with their arguments, environment, output, and
-exit status intact. `check` and `test` currently always use Cargo.
+exit status intact. A successful `cinder clean`, including when Cargo global
+options precede the command, also removes the current project's Cinder-owned
+state and fast-run siblings. If Cinder itself is installed as `cargo`, it skips
+its own executable on `PATH` and delegates to the next real Cargo executable;
+`CINDER_REAL_CARGO` remains available as an explicit override.
 
 The fast path is rejected for cases including:
 
@@ -160,8 +195,9 @@ The fast path is rejected for cases including:
   build-script inputs, compiler context, or other project Rust inputs that do
   not match a retained validated state;
 - release or custom profiles, custom targets or runners, command-line Cargo
-  configuration, examples, tests, benches, multiple executables, and
-  explicit multi-target/library selectors;
+  configuration, benches, multiple selected outputs, workspace-wide targets,
+  artifact-reporting modes, and other command shapes whose complete output
+  contract is ambiguous;
 - missing reproducibility inputs, stale state, unsupported artifacts, and
   non-macOS targets.
 
@@ -190,7 +226,9 @@ cover standalone packages, virtual workspaces, linked library targets, static
 libraries, revision replay, build-script content changes, new auto targets,
 Cargo-home configuration, compiler identity, wrapper chaining, runtime linker
 state, Cargo clean/partial-clean behavior, target locking, cache pruning, Cargo
-freshness after a build patch, and unsupported-edit fallback.
+freshness after a build patch, Cargo shim recursion, global options and built-in
+aliases, no-change check/test output validation, encoded Cargo dep-info,
+build-script default package watches, and unsupported-edit fallback.
 
 For the full safety boundary, see [the architecture notes](docs/architecture.md).
 
