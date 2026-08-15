@@ -39,6 +39,11 @@ pub fn run_cargo(
         .transpose()?;
     let captures_build = arguments.first().and_then(|value| value.to_str()) == Some("build")
         && receipt_directory.is_some();
+    let selects_binary = arguments.iter().any(|argument| {
+        argument
+            .to_str()
+            .is_some_and(|argument| argument == "--bin" || argument.starts_with("--bin="))
+    });
     let arguments = crate::run::cargo_arguments(arguments)?;
 
     if captures_build {
@@ -52,9 +57,10 @@ pub fn run_cargo(
             .status()
             .map_err(|error| format!("could not execute {}: {error}", cargo.display()))?;
         if status.success() {
-            crate::run::schedule_completed_build(receipt_directory, &run_context).unwrap_or_else(
-                |error| eprintln!("cinder: could not prepare the next fast build: {error}"),
-            );
+            crate::run::schedule_completed_build(receipt_directory, &run_context, selects_binary)
+                .unwrap_or_else(|error| {
+                    eprintln!("cinder: could not prepare the next fast build: {error}")
+                });
         }
         if !status.success() {
             let _ = std::fs::remove_dir_all(receipt_directory);
