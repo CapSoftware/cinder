@@ -103,6 +103,7 @@ mod patch;
 mod replay;
 mod source;
 mod state;
+mod unitcache;
 
 pub use capture::{
     cargo_arguments, cargo_subcommand, stage_artifact_receipts, stage_run_context,
@@ -1748,6 +1749,120 @@ pub fn record_test_state_command(arguments: Vec<OsString>) -> Result<u8, String>
         .map_err(|error| format!("could not read test state context: {error}"))?;
     let _ = record_completed_test(Path::new(&receipt_directory), &context)?;
     Ok(0)
+}
+
+/// Speculatively restores proven-identical cached dependency units into the
+/// destination target directory before Cargo runs. Purely best-effort: every
+/// failure or ambiguity degrades to running Cargo against an untouched
+/// target directory, and Cargo's own fingerprint comparison decides whether
+/// any restored unit is actually fresh.
+#[cfg(target_os = "macos")]
+pub fn restore_cached_units(arguments: &[OsString]) {
+    let started = Instant::now();
+    let Some(location) = unitcache::resolve_location(arguments) else {
+        return;
+    };
+    let Some(digest) = unitcache::rustc_identity_digest() else {
+        return;
+    };
+    match unitcache::restore_units(&location, &digest) {
+        Ok(counts) => {
+            if env::var_os(TRACE_RUN).is_some() {
+                eprintln!(
+                    "    Cinder trace: unit cache restored {} of {} candidates \
+                     (existing {}, conflicts {}, group-unavailable {}, \
+                     digest-failures {}) in {:?}",
+                    counts.restored,
+                    counts.candidates,
+                    counts.skipped_existing,
+                    counts.skipped_conflict,
+                    counts.skipped_group,
+                    counts.digest_failures,
+                    started.elapsed()
+                );
+            }
+        }
+        Err(error) => {
+            if env::var_os(TRACE_RUN).is_some() {
+                eprintln!("    Cinder trace: unit cache restore failed ({error})");
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn restore_cached_units(_arguments: &[OsString]) {}
+
+/// Schedules the background scan that captures qualifying dependency units
+/// from a finished successful build into the unit cache.
+#[cfg(target_os = "macos")]
+pub fn schedule_unit_record(arguments: &[OsString]) {
+    let Some(location) = unitcache::resolve_location(arguments) else {
+        return;
+    };
+    let Some(digest) = unitcache::rustc_identity_digest() else {
+        return;
+    };
+    if env::var_os(SYNCHRONOUS_STATE_RECORDING).is_some() {
+        if let Err(error) = unitcache::record_units(
+            &location.profile_directory,
+            &digest,
+            &location.workspace_root,
+        ) {
+            if env::var_os(TRACE_RUN).is_some() {
+                eprintln!("    Cinder trace: unit cache recording failed ({error})");
+            }
+        }
+        return;
+    }
+    let Ok(cinder) = env::current_exe().and_then(fs::canonicalize) else {
+        return;
+    };
+    let _ = Command::new(cinder)
+        .arg("__record-units")
+        .arg(&location.profile_directory)
+        .arg(&digest)
+        .arg(&location.workspace_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn schedule_unit_record(_arguments: &[OsString]) {}
+
+#[cfg(target_os = "macos")]
+pub fn record_units_command(arguments: Vec<OsString>) -> Result<u8, String> {
+    let [profile_directory, digest, workspace_root] = <[OsString; 3]>::try_from(arguments)
+        .map_err(|_| {
+            "unit cache recorder requires profile directory, compiler digest, and workspace root"
+                .to_owned()
+        })?;
+    let digest = digest
+        .to_str()
+        .ok_or_else(|| "unit cache recorder digest is not UTF-8".to_owned())?;
+    let _ = unitcache::record_units(
+        Path::new(&profile_directory),
+        digest,
+        Path::new(&workspace_root),
+    )?;
+    Ok(0)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn record_units_command(_arguments: Vec<OsString>) -> Result<u8, String> {
+    Ok(0)
+}
+
+#[cfg(target_os = "macos")]
+pub fn clear_unit_cache() -> Result<(), String> {
+    unitcache::clear()
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn clear_unit_cache() -> Result<(), String> {
+    Ok(())
 }
 
 /// The hidden `RUSTC_WRAPPER` mode used only during environment-witness
