@@ -1,15 +1,11 @@
 use std::{
     env,
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     io,
     path::{Path, PathBuf},
     process::Command,
+    time::Instant,
 };
-
-const RUSTC_WRAPPER_MODE: &str = "CINDER_RUSTC_WRAPPER_MODE";
-const WRAPPER_ACTIVE: &str = "CINDER_WRAPPER_ACTIVE";
-const NEXT_RUSTC_WRAPPER: &str = "CINDER_NEXT_RUSTC_WRAPPER";
-const ORIGINAL_RUSTC_WRAPPER: &str = "CINDER_ORIGINAL_RUSTC_WRAPPER";
 
 pub fn run_cargo(
     arguments: Vec<OsString>,
@@ -20,38 +16,67 @@ pub fn run_cargo(
     let run_context =
         crate::run::run_context_with_cargo(&arguments, launch_policy, cargo.as_os_str());
     let subcommand = crate::run::cargo_subcommand(&arguments);
-    match subcommand {
-        Some("run" | "r") => {
-            if let Err(error) = crate::run::try_fast_run(&arguments, &run_context, launch_policy) {
-                eprintln!("cinder: fast run unavailable ({error}); using Cargo");
-            }
+    if matches!(subcommand, Some("test" | "t")) {
+        if let Some(status) =
+            recorded_fast_test_decision(|| crate::run::try_fast_test(&arguments, &run_context))
+        {
+            return Ok(status);
         }
-        Some("build" | "b") => match crate::run::try_fast_build(&arguments, &run_context) {
-            Ok(true) => return Ok(0),
-            Ok(false) => {}
-            Err(error) => eprintln!("cinder: fast build unavailable ({error}); using Cargo"),
-        },
-        Some("check" | "c") => match crate::run::try_fast_check(&arguments, &run_context) {
-            Ok(true) => return Ok(0),
-            Ok(false) => {}
-            Err(error) => eprintln!("cinder: fast check unavailable ({error}); using Cargo"),
-        },
-        Some("test" | "t") => match crate::run::try_fast_test(&arguments, &run_context) {
-            Ok(true) => return Ok(0),
-            Ok(false) => {}
-            Err(error) => eprintln!("cinder: fast test unavailable ({error}); using Cargo"),
-        },
-        _ => {}
     }
-    let context_path = matches!(subcommand, Some("run" | "r"))
-        .then(|| crate::run::stage_run_context(&run_context))
-        .transpose()?;
-    let receipt_directory = crate::run::artifact_capture_eligible(&arguments)?
+    let accelerated = match subcommand {
+        Some("run" | "r") => recorded_fast_decision(crate::usage::CommandKind::Run, || {
+            crate::run::try_fast_run(&arguments, &run_context, launch_policy).map(|()| false)
+        }),
+        Some("build" | "b") => recorded_fast_decision(crate::usage::CommandKind::Build, || {
+            crate::run::try_fast_build(&arguments, &run_context)
+        }),
+        Some("check" | "c") => recorded_fast_decision(crate::usage::CommandKind::Check, || {
+            crate::run::try_fast_check(&arguments, &run_context)
+        }),
+        Some("test" | "t") => false,
+        _ => false,
+    };
+    if accelerated {
+        return Ok(0);
+    }
+    let capture_mode = if crate::run::artifact_capture_eligible(&arguments)? {
+        let capture_compiler_recipes = matches!(subcommand, Some("check" | "c"))
+            && env::var_os(crate::run::EXPERIMENTAL_DIRECT_CHECK).as_deref()
+                == Some(OsStr::new("1"));
+        if let Some(selection) = crate::run::selected_package(&cargo, &arguments, &run_context) {
+            CaptureMode::CargoMessages {
+                selection,
+                capture_compiler_recipes,
+            }
+        } else {
+            CaptureMode::None
+        }
+    } else {
+        CaptureMode::None
+    };
+    if env::var_os(crate::run::TRACE_RUN).is_some() {
+        eprintln!("    Cinder trace: Cargo capture={}", capture_mode.name());
+    }
+    let receipt_directory = (!matches!(capture_mode, CaptureMode::None))
         .then(crate::run::stage_artifact_receipts)
         .transpose()?;
+    let test_execution = matches!(subcommand, Some("test" | "t"))
+        && crate::run::test_execution_eligible(&arguments)?;
+    let context_path = if receipt_directory.is_some() {
+        match subcommand {
+            Some("run" | "r") => Some(crate::run::stage_run_context(&run_context)?),
+            Some("test" | "t") if test_execution => {
+                Some(crate::run::stage_test_context(&run_context)?)
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
     let captures_build = matches!(subcommand, Some("build" | "b")) && receipt_directory.is_some();
     let captures_check = matches!(subcommand, Some("check" | "c")) && receipt_directory.is_some();
-    let captures_test = matches!(subcommand, Some("test" | "t")) && receipt_directory.is_some();
+    let captures_test =
+        matches!(subcommand, Some("test" | "t")) && receipt_directory.is_some() && !test_execution;
     let cleans_project = subcommand == Some("clean");
     let selects_executable = arguments
         .iter()
@@ -63,74 +88,46 @@ pub fn run_cargo(
                     .any(|flag| argument == *flag || argument.starts_with(&format!("{flag}=")))
             })
         });
-    let arguments = crate::run::cargo_arguments(arguments)?;
+    let arguments = crate::run::cargo_arguments(
+        arguments,
+        context_path.as_deref(),
+        receipt_directory.as_deref(),
+        matches!(capture_mode, CaptureMode::CargoMessages { .. }),
+    )?;
 
-    if captures_build {
+    if captures_build || captures_check || captures_test {
         let receipt_directory = receipt_directory
             .as_deref()
-            .ok_or_else(|| "build receipt directory was not staged".to_owned())?;
+            .ok_or_else(|| "artifact receipt directory was not staged".to_owned())?;
         let mut command = Command::new(&cargo);
         command.args(arguments);
-        configure_rustc_wrapper(&mut command, receipt_directory)?;
-        let status = command
-            .status()
-            .map_err(|error| format!("could not execute {}: {error}", cargo.display()))?;
+        crate::usage::remove_control_environment(&mut command);
+        let status = execute_captured_cargo(&mut command, receipt_directory, &capture_mode)?;
         if status.success() {
-            crate::run::schedule_completed_build(
-                receipt_directory,
-                &run_context,
-                selects_executable,
-            )
-            .unwrap_or_else(|error| {
-                eprintln!("cinder: could not prepare the next fast build: {error}")
-            });
-        }
-        if !status.success() {
-            let _ = std::fs::remove_dir_all(receipt_directory);
-        }
-        return Ok(exit_code(status));
-    }
-
-    if captures_check {
-        let receipt_directory = receipt_directory
-            .as_deref()
-            .ok_or_else(|| "check receipt directory was not staged".to_owned())?;
-        let mut command = Command::new(&cargo);
-        command.args(arguments);
-        configure_rustc_wrapper(&mut command, receipt_directory)?;
-        let status = command
-            .status()
-            .map_err(|error| format!("could not execute {}: {error}", cargo.display()))?;
-        if status.success() {
-            crate::run::schedule_completed_check(
-                receipt_directory,
-                &run_context,
-                selects_executable,
-            )
-            .unwrap_or_else(|error| {
-                eprintln!("cinder: could not prepare the next fast check: {error}")
-            });
-        }
-        if !status.success() {
-            let _ = std::fs::remove_dir_all(receipt_directory);
-        }
-        return Ok(exit_code(status));
-    }
-
-    if captures_test {
-        let receipt_directory = receipt_directory
-            .as_deref()
-            .ok_or_else(|| "test receipt directory was not staged".to_owned())?;
-        let mut command = Command::new(&cargo);
-        command.args(arguments);
-        configure_rustc_wrapper(&mut command, receipt_directory)?;
-        let status = command
-            .status()
-            .map_err(|error| format!("could not execute {}: {error}", cargo.display()))?;
-        if status.success() {
-            crate::run::schedule_completed_test(receipt_directory, &run_context).unwrap_or_else(
-                |error| eprintln!("cinder: could not prepare the next fast test: {error}"),
-            );
+            if captures_build {
+                crate::run::schedule_completed_build(
+                    receipt_directory,
+                    &run_context,
+                    selects_executable,
+                )
+                .unwrap_or_else(|error| {
+                    eprintln!("cinder: could not prepare the next fast build: {error}")
+                });
+            } else if captures_check {
+                crate::run::schedule_completed_check(
+                    receipt_directory,
+                    &run_context,
+                    selects_executable,
+                )
+                .unwrap_or_else(|error| {
+                    eprintln!("cinder: could not prepare the next fast check: {error}")
+                });
+            } else {
+                crate::run::schedule_completed_test(receipt_directory, &run_context)
+                    .unwrap_or_else(|error| {
+                        eprintln!("cinder: could not prepare the next fast test: {error}")
+                    });
+            }
         }
         if !status.success() {
             let _ = std::fs::remove_dir_all(receipt_directory);
@@ -139,8 +136,10 @@ pub fn run_cargo(
     }
 
     if cleans_project {
-        let status = Command::new(&cargo)
-            .args(&arguments)
+        let mut command = Command::new(&cargo);
+        command.args(&arguments);
+        crate::usage::remove_control_environment(&mut command);
+        let status = command
             .status()
             .map_err(|error| format!("could not execute {}: {error}", cargo.display()))?;
         if status.success() {
@@ -157,11 +156,16 @@ pub fn run_cargo(
 
         let mut command = Command::new(&cargo);
         command.args(arguments);
-        if let Some(context_path) = context_path {
-            command.env(crate::run::RUN_CONTEXT_FILE, context_path);
-        }
+        crate::usage::remove_control_environment(&mut command);
         if let Some(receipt_directory) = receipt_directory.as_deref() {
-            configure_rustc_wrapper(&mut command, receipt_directory)?;
+            let status = execute_captured_cargo(&mut command, receipt_directory, &capture_mode)?;
+            if !status.success() {
+                let _ = std::fs::remove_dir_all(receipt_directory);
+                if let Some(context_path) = context_path {
+                    let _ = std::fs::remove_file(context_path);
+                }
+            }
+            return Ok(exit_code(status));
         }
         let error = command.exec();
         Err(format!("could not execute {}: {error}", cargo.display()))
@@ -171,149 +175,122 @@ pub fn run_cargo(
     {
         let mut command = Command::new(&cargo);
         command.args(arguments);
-        if let Some(context_path) = context_path {
-            command.env(crate::run::RUN_CONTEXT_FILE, context_path);
-        }
-        let status = command
-            .status()
-            .map_err(|error| format!("could not execute {}: {error}", cargo.display()))?;
-        Ok(status.code().unwrap_or(1).clamp(0, u8::MAX as i32) as u8)
-    }
-}
-
-pub fn restore_runtime_environment(command: &mut Command) {
-    if env::var_os(WRAPPER_ACTIVE).as_deref() != Some("1".as_ref()) {
-        return;
-    }
-    if let Some(wrapper) = env::var_os(ORIGINAL_RUSTC_WRAPPER) {
-        command.env("RUSTC_WRAPPER", wrapper);
-    } else {
-        command.env_remove("RUSTC_WRAPPER");
-    }
-    for key in [
-        RUSTC_WRAPPER_MODE,
-        WRAPPER_ACTIVE,
-        NEXT_RUSTC_WRAPPER,
-        ORIGINAL_RUSTC_WRAPPER,
-        crate::run::ARTIFACT_RECEIPT_DIRECTORY,
-    ] {
-        command.env_remove(key);
-    }
-}
-
-fn configure_rustc_wrapper(command: &mut Command, receipt_directory: &Path) -> Result<(), String> {
-    let cinder = env::current_exe()
-        .and_then(std::fs::canonicalize)
-        .map_err(|error| format!("could not identify the Cinder executable: {error}"))?;
-    command
-        .env("RUSTC_WRAPPER", &cinder)
-        .env(RUSTC_WRAPPER_MODE, "1")
-        .env(WRAPPER_ACTIVE, "1")
-        .env(crate::run::ARTIFACT_RECEIPT_DIRECTORY, receipt_directory);
-    if let Some(wrapper) = env::var_os("RUSTC_WRAPPER").filter(|wrapper| !wrapper.is_empty()) {
-        if canonical_if_explicit(Path::new(&wrapper))?.as_deref() == Some(cinder.as_path()) {
-            return Err("RUSTC_WRAPPER resolves to Cinder itself".to_owned());
-        }
-        command
-            .env(NEXT_RUSTC_WRAPPER, &wrapper)
-            .env(ORIGINAL_RUSTC_WRAPPER, wrapper);
-    } else {
-        command
-            .env_remove(NEXT_RUSTC_WRAPPER)
-            .env_remove(ORIGINAL_RUSTC_WRAPPER);
-    }
-    Ok(())
-}
-
-/// Runs Cinder as a transparent `RUSTC_WRAPPER`.
-///
-/// Cargo invokes wrappers as `<wrapper> <rustc> <rustc arguments...>`. Extra
-/// arguments are only added to the explicitly selected crate, so dependency
-/// compilation remains identical to Cargo. This is an internal compatibility
-/// boundary: normal Cinder commands do not enable experimental compiler flags.
-pub fn run_rustc_wrapper(mut arguments: Vec<OsString>) -> Result<u8, String> {
-    if arguments.is_empty() {
-        return Err("rustc wrapper mode requires the compiler path".to_owned());
-    }
-
-    let compiler = PathBuf::from(arguments.remove(0));
-    let primary_crate = env::var_os("CINDER_RUSTC_PRIMARY_CRATE");
-    let crate_name = rustc_crate_name(&arguments);
-
-    let selected = primary_crate.as_deref() == crate_name;
-    if selected {
-        if env::var_os("CINDER_RUSTC_RLIB_EXTERNS").as_deref() == Some("1".as_ref()) {
-            prefer_rlib_externs(&mut arguments);
-        }
-        if let Some(extra_arguments) = env::var_os("CINDER_RUSTC_EXTRA_ARGS") {
-            let extra_arguments = extra_arguments
-                .to_str()
-                .ok_or_else(|| "CINDER_RUSTC_EXTRA_ARGS must be valid UTF-8".to_owned())?;
-            arguments.extend(
-                extra_arguments
-                    .split('\n')
-                    .filter(|argument| !argument.is_empty())
-                    .map(OsString::from),
-            );
-        }
-    }
-
-    let captures_artifact = env::var_os(crate::run::ARTIFACT_RECEIPT_DIRECTORY).is_some();
-    if captures_artifact {
-        let mut command = wrapped_compiler_command(&compiler, &arguments);
-        configure_selected_compiler(&mut command, selected);
-        let status = command.status().map_err(|error| {
-            format!(
-                "could not execute wrapped compiler {}: {error}",
-                compiler.display()
-            )
-        })?;
-        if status.success() {
-            crate::run::record_artifact_receipt(&arguments).unwrap_or_else(|error| {
-                eprintln!("cinder: could not record compiler artifact: {error}");
-            });
-        }
-        return Ok(exit_code(status));
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-
-        let mut command = wrapped_compiler_command(&compiler, &arguments);
-        configure_selected_compiler(&mut command, selected);
-        let error = command.exec();
-        Err(format!(
-            "could not execute wrapped compiler {}: {error}",
-            compiler.display()
-        ))
-    }
-
-    #[cfg(not(unix))]
-    {
-        let mut command = wrapped_compiler_command(&compiler, &arguments);
-        configure_selected_compiler(&mut command, selected);
-        let status = command.status().map_err(|error| {
-            format!(
-                "could not execute wrapped compiler {}: {error}",
-                compiler.display()
-            )
-        })?;
-        Ok(status.code().unwrap_or(1).clamp(0, u8::MAX as i32) as u8)
-    }
-}
-
-fn wrapped_compiler_command(compiler: &Path, arguments: &[OsString]) -> Command {
-    let mut command = env::var_os(NEXT_RUSTC_WRAPPER).map_or_else(
-        || Command::new(compiler),
-        |wrapper| {
-            let mut command = Command::new(wrapper);
-            command.arg(compiler);
+        crate::usage::remove_control_environment(&mut command);
+        let status = if let Some(receipt_directory) = receipt_directory.as_deref() {
+            execute_captured_cargo(&mut command, receipt_directory, &capture_mode)?
+        } else {
             command
-        },
-    );
-    command.args(arguments);
-    command
+                .status()
+                .map_err(|error| format!("could not execute {}: {error}", cargo.display()))?
+        };
+        Ok(status.code().unwrap_or(1).clamp(0, u8::MAX as i32) as u8)
+    }
+}
+
+enum CaptureMode {
+    None,
+    CargoMessages {
+        selection: crate::run::PackageSelection,
+        capture_compiler_recipes: bool,
+    },
+}
+
+impl CaptureMode {
+    const fn name(&self) -> &'static str {
+        match self {
+            Self::None => "disabled",
+            Self::CargoMessages {
+                capture_compiler_recipes: false,
+                ..
+            } => "messages",
+            Self::CargoMessages {
+                capture_compiler_recipes: true,
+                ..
+            } => "messages+compiler-observer",
+        }
+    }
+}
+
+fn execute_captured_cargo(
+    command: &mut Command,
+    receipt_directory: &Path,
+    capture_mode: &CaptureMode,
+) -> Result<std::process::ExitStatus, String> {
+    match capture_mode {
+        CaptureMode::CargoMessages {
+            selection,
+            capture_compiler_recipes,
+        } => crate::run::run_cargo_messages(
+            command,
+            receipt_directory,
+            selection,
+            *capture_compiler_recipes,
+        ),
+        CaptureMode::None => Err("Cargo capture mode was not selected".to_owned()),
+    }
+}
+
+fn recorded_fast_decision<F>(command: crate::usage::CommandKind, operation: F) -> bool
+where
+    F: FnOnce() -> Result<bool, String>,
+{
+    let started = Instant::now();
+    let result = operation();
+    match result {
+        Ok(true) => true,
+        Ok(false) => {
+            crate::usage::record(
+                command,
+                crate::usage::Outcome::CargoFallback,
+                started.elapsed(),
+            );
+            false
+        }
+        Err(error) => {
+            crate::usage::record(
+                command,
+                crate::usage::Outcome::FastPathError,
+                started.elapsed(),
+            );
+            eprintln!(
+                "cinder: fast {} unavailable ({error}); using Cargo",
+                command.name()
+            );
+            false
+        }
+    }
+}
+
+fn recorded_fast_test_decision<F>(operation: F) -> Option<u8>
+where
+    F: FnOnce() -> Result<Option<u8>, String>,
+{
+    let started = Instant::now();
+    match operation() {
+        Ok(Some(status)) => Some(status),
+        Ok(None) => {
+            crate::usage::record(
+                crate::usage::CommandKind::Test,
+                crate::usage::Outcome::CargoFallback,
+                started.elapsed(),
+            );
+            None
+        }
+        Err(error) => {
+            crate::usage::record(
+                crate::usage::CommandKind::Test,
+                crate::usage::Outcome::FastPathError,
+                started.elapsed(),
+            );
+            eprintln!("cinder: fast test unavailable ({error}); using Cargo");
+            None
+        }
+    }
+}
+
+#[cfg_attr(windows, allow(dead_code))]
+pub fn restore_runtime_environment(command: &mut Command) {
+    crate::usage::remove_control_environment(command);
 }
 
 fn exit_code(status: std::process::ExitStatus) -> u8 {
@@ -321,39 +298,6 @@ fn exit_code(status: std::process::ExitStatus) -> u8 {
         .code()
         .and_then(|code| u8::try_from(code).ok())
         .unwrap_or(1)
-}
-
-fn configure_selected_compiler(command: &mut Command, selected: bool) {
-    if selected && env::var_os("CINDER_RUSTC_BOOTSTRAP").as_deref() == Some("1".as_ref()) {
-        command.env("RUSTC_BOOTSTRAP", "1");
-    }
-}
-
-fn prefer_rlib_externs(arguments: &mut [OsString]) {
-    for index in 0..arguments.len() {
-        let value_index = if arguments[index] == "--extern" {
-            index + 1
-        } else {
-            continue;
-        };
-        let Some(value) = arguments.get(value_index).and_then(|value| value.to_str()) else {
-            continue;
-        };
-        let Some((name, path)) = value.split_once('=') else {
-            continue;
-        };
-        let rlib = Path::new(path).with_extension("rlib");
-        if Path::new(path).extension() == Some("rmeta".as_ref()) && rlib.is_file() {
-            arguments[value_index] = OsString::from(format!("{name}={}", rlib.display()));
-        }
-    }
-}
-
-fn rustc_crate_name(arguments: &[OsString]) -> Option<&std::ffi::OsStr> {
-    arguments
-        .windows(2)
-        .find(|pair| pair[0] == "--crate-name")
-        .map(|pair| pair[1].as_os_str())
 }
 
 fn cargo_executable() -> Result<PathBuf, String> {

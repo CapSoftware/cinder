@@ -1,6 +1,15 @@
 mod benchmark;
 mod command;
+#[cfg(not(windows))]
 mod run;
+#[cfg(windows)]
+#[path = "run_windows.rs"]
+mod run;
+#[cfg(not(windows))]
+mod usage;
+#[cfg(windows)]
+#[path = "usage_windows.rs"]
+mod usage;
 
 use std::{env, ffi::OsString, path::Path, process::ExitCode};
 
@@ -29,14 +38,6 @@ fn invoked_as_cargo(executable: &std::ffi::OsStr) -> bool {
 }
 
 fn run(arguments: Vec<OsString>, launch_policy: run::LaunchPolicy) -> Result<u8, String> {
-    let internal_command = arguments
-        .first()
-        .and_then(|argument| argument.to_str())
-        .is_some_and(|argument| argument.starts_with("__"));
-    if !internal_command && env::var_os("CINDER_RUSTC_WRAPPER_MODE").is_some() {
-        return command::run_rustc_wrapper(arguments);
-    }
-
     match arguments.first().and_then(|value| value.to_str()) {
         None | Some("--help" | "-h") => {
             print_help();
@@ -46,9 +47,16 @@ fn run(arguments: Vec<OsString>, launch_policy: run::LaunchPolicy) -> Result<u8,
             println!("cinder {}", env!("CARGO_PKG_VERSION"));
             Ok(0)
         }
+        Some("stats") => usage::print_report(&arguments[1..]),
         Some("__bench-cap") => benchmark::run(arguments.into_iter().skip(1).collect()),
         Some("__run-artifact") => run::run_artifact(arguments.into_iter().skip(1).collect()),
+        Some("__run-test-artifact") => {
+            run::run_test_artifact(arguments.into_iter().skip(1).collect())
+        }
         Some("__record-run") => run::record_run_state_command(&arguments[1..]),
+        Some("__record-test-execution") => {
+            run::record_test_execution_state_command(&arguments[1..])
+        }
         Some("__record-build") => {
             run::record_build_state_command(arguments.into_iter().skip(1).collect())
         }
@@ -70,7 +78,8 @@ fn print_help() {
            run      Build and run a binary or example\n  \
            build    Compile a package\n  \
            check    Analyze a package without producing a binary\n  \
-           test     Run tests\n\n\
+           test     Run tests\n  \
+           stats    Report privacy-safe local acceleration evidence\n\n\
          All other commands and options are passed through to Cargo."
     );
 }

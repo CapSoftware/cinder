@@ -29,10 +29,10 @@ const DISABLE_FAST_RUN: &str = "CINDER_DISABLE_FAST_RUN";
 const DISABLE_FAST_BUILD: &str = "CINDER_DISABLE_FAST_BUILD";
 const DISABLE_FAST_CHECK: &str = "CINDER_DISABLE_FAST_CHECK";
 const DISABLE_FAST_TEST: &str = "CINDER_DISABLE_FAST_TEST";
-pub const RUN_CONTEXT_FILE: &str = "CINDER_RUN_CONTEXT_FILE";
-pub const ARTIFACT_RECEIPT_DIRECTORY: &str = "CINDER_ARTIFACT_RECEIPT_DIRECTORY";
+pub const EXPERIMENTAL_DIRECT_CHECK: &str = "CINDER_EXPERIMENTAL_DIRECT_CHECK";
+pub const TRACE_RUN: &str = "CINDER_TRACE_RUN";
+pub const SYNCHRONOUS_STATE_RECORDING: &str = "CINDER_SYNCHRONOUS_STATE_RECORDING";
 const COALESCE_RUN_EVENTS: &str = "CINDER_COALESCE_RUN_EVENTS";
-const SYNCHRONOUS_STATE_RECORDING: &str = "CINDER_SYNCHRONOUS_STATE_RECORDING";
 const DUPLICATE_EVENT_SETTLE_TIME: Duration = Duration::from_millis(1_250);
 const DUPLICATE_EVENT_MAX_AGE: Duration = Duration::from_secs(2);
 const REVISION_HISTORY_LIMIT: usize = 8;
@@ -95,18 +95,22 @@ mod capture;
 mod cargo;
 mod context;
 mod inputs;
+mod messages;
+mod observe;
 mod patch;
+mod replay;
 mod source;
 mod state;
 
 pub use capture::{
-    cargo_arguments, cargo_subcommand, record_artifact_receipt, stage_artifact_receipts,
-    stage_run_context,
+    cargo_arguments, cargo_subcommand, stage_artifact_receipts, stage_run_context,
+    stage_test_context,
 };
-pub use cargo::{artifact_capture_eligible, clear_project_state};
+pub use cargo::{artifact_capture_eligible, clear_project_state, test_execution_eligible};
 #[cfg(test)]
 pub use context::run_context;
 pub use context::run_context_with_cargo;
+pub use messages::{PackageSelection, run_cargo_messages, selected_package};
 
 use cache::{
     history_directory, history_recency, is_cinder_run_artifact, make_private_directory,
@@ -117,28 +121,32 @@ use cache::{
 use capture::cargo_subcommand_index;
 use cargo::{
     build_eligible, canonical_current_directory, check_eligible, eligible, host_target,
-    test_eligible, toml_string,
+    manifest_has_standard_library_test_harness_at, test_eligible, test_executes, toml_string,
 };
 use context::{append_context_value, bind_observed_shell_environment, compiler_unit_graph};
 use inputs::{
-    add_cargo_control_inputs, add_project_rust_inputs, artifact_file_identity,
+    BuildInputGraph, RUNTIME_LINKER_ENVIRONMENT_KEYS, artifact_file_identity,
     artifact_file_identity_from_metadata, artifact_identity, artifact_metadata, build_inputs,
     build_source_paths, cargo_outputs_for_artifact, cargo_profile_directory,
-    input_entries_are_unchanged, input_entries_match_revision, project_may_have_build_script,
-    read_cargo_outputs, read_inputs, read_runtime_environment, read_source_paths,
-    runtime_linker_environment, write_cargo_outputs, write_inputs, write_runtime_environment,
-    write_source_paths,
+    dependency_output_paths, input_entries_are_unchanged, input_entries_match_revision,
+    package_may_have_build_script, project_may_have_build_script, project_topology_and_inputs,
+    project_topology_is_unchanged, read_cargo_outputs, read_inputs, read_project_topology,
+    read_runtime_environment, read_source_paths, runtime_linker_environment, write_cargo_outputs,
+    write_inputs, write_project_topology, write_runtime_environment, write_source_paths,
 };
+use observe::CompilerObserver;
 use patch::{
     PatchMode, changed_format_segment, clone_file, make_cached_artifact_read_only,
     make_owner_writable, patch_artifact, remove_launch_xattrs,
 };
+use replay::{CompilerRecipe, read_compiler_recipe, replay_compiler, write_compiler_recipe};
 use source::{
     HistoryProbeCache, LiteralChange, build_literal_index, find_literal_change, read_literal_index,
     snapshot_sources, source_revision_digest, sources_are_unchanged, write_literal_index,
 };
 use state::{
-    ArtifactFileIdentity, ArtifactReceipt, CargoOutputs, InputEntry, LiteralIndexEntry, State,
+    ArtifactFileIdentity, ArtifactReceipt, BuildScriptOutput, CargoOutputEntry, CargoOutputs,
+    InputEntry, LiteralIndexEntry, ProjectTopology, State, TopologyDirectory,
     read_artifact_receipt, write_artifact_receipt,
 };
 
@@ -149,6 +157,7 @@ pub fn try_fast_run(
     run_context: &[u8],
     launch_policy: LaunchPolicy,
 ) -> Result<(), String> {
+    let decision_started = Instant::now();
     if !eligible(arguments)? {
         return Ok(());
     }
@@ -157,14 +166,13 @@ pub fn try_fast_run(
             .map_err(|error| format!("could not inspect current directory: {error}"))?,
     )
     .map_err(|error| format!("could not resolve current directory: {error}"))?;
+    let mut history_probes = HistoryProbeCache::default();
     let current = State::load(&directory, StateKind::Run)?;
     if let Some(state) = current.as_ref().filter(|state| {
-        state.context_matches(run_context)
-            && state.artifact_is_unchanged().unwrap_or(false)
-            && state.cargo_outputs_are_available()
+        state.context_matches(run_context) && state.artifact_is_unchanged().unwrap_or(false)
     }) {
         if let Some(change) = find_literal_change(&directory, &state.snapshot, &state.sources)? {
-            if state.inputs_are_unchanged(&directory)? {
+            if cargo_outputs_and_inputs_are_unchanged(state, &directory)? {
                 if let Some(patched) =
                     patch_artifact(&directory, state, &change, PatchMode::RunSibling)?
                 {
@@ -175,6 +183,11 @@ pub fn try_fast_run(
                         &change,
                         launch_policy.coalesces_duplicate_events(),
                     )?;
+                    crate::usage::record(
+                        crate::usage::CommandKind::Run,
+                        crate::usage::Outcome::BinaryPatch,
+                        decision_started.elapsed(),
+                    );
                     eprintln!(
                         "    Cinder patched {} from {} without recompiling",
                         change.relative.display(),
@@ -190,13 +203,18 @@ pub fn try_fast_run(
                     );
                 }
             }
-        } else if state.sources_match_revision(&directory)?
-            && state.inputs_are_unchanged(&directory)?
+        } else if history_probes.source_digest(&directory, &state.sources)? == state.source_digest
+            && cargo_outputs_and_inputs_are_unchanged(state, &directory)?
         {
             let can_launch_current = state.artifact != state.public_artifact
                 && (!launch_policy.coalesces_duplicate_events()
                     || State::consume_fresh_duplicate(&directory)?);
             if can_launch_current {
+                crate::usage::record(
+                    crate::usage::CommandKind::Run,
+                    crate::usage::Outcome::CurrentReuse,
+                    decision_started.elapsed(),
+                );
                 eprintln!("    Cinder reusing {}", state.artifact.display());
                 return exec_artifact(
                     &state.artifact,
@@ -209,7 +227,13 @@ pub fn try_fast_run(
         }
     }
 
-    let Some(historical) = State::matching_history(&directory, StateKind::Run, run_context, None)?
+    let Some(historical) = State::matching_history(
+        &directory,
+        StateKind::Run,
+        run_context,
+        None,
+        &mut history_probes,
+    )?
     else {
         return Ok(());
     };
@@ -220,6 +244,11 @@ pub fn try_fast_run(
         &restored,
         launch_policy.coalesces_duplicate_events(),
     )?;
+    crate::usage::record(
+        crate::usage::CommandKind::Run,
+        crate::usage::Outcome::RevisionRestore,
+        decision_started.elapsed(),
+    );
     eprintln!(
         "    Cinder restored a validated previous build of {} without recompiling",
         historical.program_name.to_string_lossy()
@@ -240,23 +269,22 @@ pub fn try_fast_run(
 /// Returning `Ok(false)` is a normal cache miss. Cargo remains responsible for
 /// every unsupported command shape and for refreshing state after a miss.
 pub fn try_fast_build(arguments: &[OsString], build_context: &[u8]) -> Result<bool, String> {
+    let decision_started = Instant::now();
     if !build_eligible(arguments)? {
         return Ok(false);
     }
     let directory = canonical_current_directory()?;
-    let current = State::load(&directory, StateKind::Build)?;
-    if env::var_os("CINDER_TRACE_RUN").is_some() {
+    let stage_started = Instant::now();
+    let current = State::load_lock_probe(&directory, StateKind::Build)?;
+    patch::trace_run("probe current build state", stage_started);
+    if env::var_os(TRACE_RUN).is_some() {
         eprintln!(
-            "    Cinder trace: current build state={} context-match={} wanted={} recorded={}",
+            "    Cinder trace: current build state={} context-match={} wanted={}",
             current.is_some(),
             current
                 .as_ref()
                 .is_some_and(|state| state.context_matches(build_context)),
             short_digest(build_context),
-            current.as_ref().map_or_else(
-                || "none".to_owned(),
-                |state| short_digest(&state.run_context)
-            )
         );
     }
     let target_lock_path = match current.filter(|state| state.context_matches(build_context)) {
@@ -270,8 +298,15 @@ pub fn try_fast_build(arguments: &[OsString], build_context: &[u8]) -> Result<bo
             path
         }
     };
+    let stage_started = Instant::now();
     let _target_lock = CargoTargetLock::acquire(&target_lock_path)?;
-    try_fast_build_locked(&directory, build_context, &target_lock_path)
+    patch::trace_run("acquire Cargo target lock", stage_started);
+    try_fast_build_locked(
+        &directory,
+        build_context,
+        &target_lock_path,
+        decision_started,
+    )
 }
 
 /// Completes an unchanged, previously validated single-unit check without
@@ -281,39 +316,94 @@ pub fn try_fast_build(arguments: &[OsString], build_context: &[u8]) -> Result<bo
 /// miss. Check state is never restored from revision history because Cinder
 /// does not fabricate Cargo fingerprints or dependency metadata.
 pub fn try_fast_check(arguments: &[OsString], check_context: &[u8]) -> Result<bool, String> {
+    let decision_started = Instant::now();
     if !check_eligible(arguments)? {
         return Ok(false);
     }
     let directory = canonical_current_directory()?;
-    let Some(state) = State::load(&directory, StateKind::Check)? else {
+    let Some(state) = State::load_lock_probe(&directory, StateKind::Check)? else {
+        if env::var_os(TRACE_RUN).is_some() {
+            eprintln!("    Cinder trace: no recorded check state");
+        }
         return Ok(false);
     };
     if !state.context_matches(check_context) {
+        if env::var_os(TRACE_RUN).is_some() {
+            eprintln!("    Cinder trace: check context changed before target lock");
+        }
         return Ok(false);
     }
     let target_lock_path = cargo_target_lock_path(&state.public_artifact)?;
     let _target_lock = CargoTargetLock::acquire(&target_lock_path)?;
+    let stage_started = Instant::now();
     let Some(state) = State::load(&directory, StateKind::Check)? else {
         return Ok(false);
     };
-    if env::var_os("CINDER_TRACE_RUN").is_some() {
-        eprintln!(
-            "    Cinder trace: locked check context={} artifact={} cargo-outputs={} sources={} inputs={}",
-            state.context_matches(check_context),
-            state.artifact_is_unchanged().unwrap_or(false),
-            state.cargo_outputs_are_available(),
-            state.sources_match_revision(&directory).unwrap_or(false),
-            state.inputs_are_unchanged(&directory).unwrap_or(false),
-        );
-    }
-    if !state.context_matches(check_context)
-        || !state.artifact_is_unchanged()?
-        || !state.cargo_outputs_are_available()
-        || !state.sources_match_revision(&directory)?
-        || !state.inputs_are_unchanged(&directory)?
-    {
+    patch::trace_run("load check state", stage_started);
+    if !state.context_matches(check_context) {
         return Ok(false);
     }
+    let stage_started = Instant::now();
+    if !state.artifact_is_unchanged()? {
+        return Ok(false);
+    }
+    patch::trace_run("validate selected check artifact", stage_started);
+    let stage_started = Instant::now();
+    let sources_match = state.sources_match_revision(&directory)?;
+    patch::trace_run("validate selected check sources", stage_started);
+    if !sources_match {
+        if env::var_os(EXPERIMENTAL_DIRECT_CHECK).as_deref() != Some(OsStr::new("1"))
+            || !state.compiler_recipe_supports_direct_check()
+        {
+            if env::var_os(TRACE_RUN).is_some() {
+                eprintln!(
+                    "    Cinder trace: locked check sources=false inputs=skipped direct=false"
+                );
+            }
+            return Ok(false);
+        }
+        if !cargo_outputs_and_inputs_are_unchanged(&state, &directory)? {
+            return Ok(false);
+        }
+        let recipe = state
+            .compiler_recipe
+            .as_ref()
+            .ok_or_else(|| "validated check state has no compiler recipe".to_owned())?;
+        let replay_directory = state_project_directory(&directory).join("compiler-replay");
+        if !replay_compiler(recipe, &replay_directory)? {
+            return Ok(false);
+        }
+        if !recipe.replayed_dependency_environment_matches(&state.cargo_outputs.dependency_file)? {
+            if env::var_os(TRACE_RUN).is_some() {
+                eprintln!(
+                    "    Cinder trace: compiler replay introduced an unmatched environment dependency"
+                );
+            }
+            return Ok(false);
+        }
+        state.record_replayed_check(&directory)?;
+        crate::usage::record(
+            crate::usage::CommandKind::Check,
+            crate::usage::Outcome::DirectCompile,
+            decision_started.elapsed(),
+        );
+        eprintln!(
+            "    Cinder replayed Cargo's validated compiler recipe for {}",
+            state.artifact.display()
+        );
+        return Ok(true);
+    }
+    if !cargo_outputs_and_inputs_are_unchanged(&state, &directory)? {
+        return Ok(false);
+    }
+    if env::var_os(TRACE_RUN).is_some() {
+        eprintln!("    Cinder trace: locked check sources=true inputs=true direct=false");
+    }
+    crate::usage::record(
+        crate::usage::CommandKind::Check,
+        crate::usage::Outcome::CurrentReuse,
+        decision_started.elapsed(),
+    );
     eprintln!(
         "    Cinder reused the validated check of {} without invoking Cargo",
         state.artifact.display()
@@ -321,41 +411,107 @@ pub fn try_fast_check(arguments: &[OsString], check_context: &[u8]) -> Result<bo
     Ok(true)
 }
 
-/// Completes an unchanged `cargo test --no-run` for one explicitly selected
-/// bin, example, library, or named integration test when Cargo's exact test
-/// executable and unit outputs still match the validated state.
-///
-/// Cinder never skips execution for normal `cargo test`; multi-target and
-/// implicit-target test commands remain entirely Cargo-owned.
-pub fn try_fast_test(arguments: &[OsString], test_context: &[u8]) -> Result<bool, String> {
+/// Reuses an unchanged test build for one explicitly selected test target.
+/// Package-root `test --lib` also runs the exact validated Cargo-built harness;
+/// broader test command shapes remain entirely Cargo-owned.
+pub fn try_fast_test(arguments: &[OsString], test_context: &[u8]) -> Result<Option<u8>, String> {
+    let decision_started = Instant::now();
     if !test_eligible(arguments)? {
-        return Ok(false);
+        return Ok(None);
     }
+    let executes_test = test_executes(arguments);
     let directory = canonical_current_directory()?;
-    let Some(state) = State::load(&directory, StateKind::Test)? else {
-        return Ok(false);
+    let Some(state) = State::load_lock_probe(&directory, StateKind::Test)? else {
+        if env::var_os(TRACE_RUN).is_some() {
+            eprintln!("    Cinder trace: no recorded test state");
+        }
+        return Ok(None);
     };
     if !state.context_matches(test_context) {
-        return Ok(false);
+        if env::var_os(TRACE_RUN).is_some() {
+            eprintln!("    Cinder trace: test context changed before target lock");
+        }
+        return Ok(None);
     }
     let target_lock_path = cargo_target_lock_path(&state.public_artifact)?;
     let _target_lock = CargoTargetLock::acquire(&target_lock_path)?;
     let Some(state) = State::load(&directory, StateKind::Test)? else {
-        return Ok(false);
+        return Ok(None);
     };
-    if !state.context_matches(test_context)
-        || !state.artifact_is_unchanged()?
-        || !state.cargo_outputs_are_available()
-        || !state.sources_match_revision(&directory)?
-        || !state.inputs_are_unchanged(&directory)?
-    {
-        return Ok(false);
+    let context_matches = state.context_matches(test_context);
+    let artifact_unchanged = state.artifact_is_unchanged()?;
+    if !context_matches || !artifact_unchanged {
+        if env::var_os(TRACE_RUN).is_some() {
+            eprintln!(
+                "    Cinder trace: locked test context={context_matches} artifact={artifact_unchanged}"
+            );
+        }
+        return Ok(None);
     }
-    eprintln!(
-        "    Cinder reused the validated test build of {} without invoking Cargo",
-        state.artifact.display()
-    );
-    Ok(true)
+    let sources_unchanged = state.sources_match_revision(&directory)?;
+    if !sources_unchanged {
+        if env::var_os(TRACE_RUN).is_some() {
+            eprintln!("    Cinder trace: locked test sources=false inputs=skipped");
+        }
+        return Ok(None);
+    }
+    if !cargo_outputs_and_inputs_are_unchanged(&state, &directory)? {
+        return Ok(None);
+    }
+    if executes_test {
+        let Some(runtime_directory) = state.validated_test_runtime_directory()? else {
+            return Ok(None);
+        };
+        crate::usage::record(
+            crate::usage::CommandKind::Test,
+            crate::usage::Outcome::CurrentReuse,
+            decision_started.elapsed(),
+        );
+        eprintln!(
+            "    Cinder running the validated test executable {} without invoking Cargo",
+            state.artifact.display()
+        );
+        run_validated_test(
+            &state.artifact,
+            runtime_arguments(arguments),
+            &state.runtime_environment,
+            &runtime_directory,
+        )
+        .map(Some)
+    } else {
+        crate::usage::record(
+            crate::usage::CommandKind::Test,
+            crate::usage::Outcome::CurrentReuse,
+            decision_started.elapsed(),
+        );
+        eprintln!(
+            "    Cinder reused the validated test build of {} without invoking Cargo",
+            state.artifact.display()
+        );
+        Ok(Some(0))
+    }
+}
+
+fn cargo_outputs_and_inputs_are_unchanged(state: &State, directory: &Path) -> Result<bool, String> {
+    let (cargo_outputs_unchanged, inputs_unchanged) = thread::scope(|scope| {
+        let cargo_outputs = scope.spawn(|| {
+            let started = Instant::now();
+            let unchanged = state.cargo_outputs_are_available();
+            patch::trace_run("validate Cargo output graph", started);
+            unchanged
+        });
+        let started = Instant::now();
+        let inputs_unchanged = state.inputs_are_unchanged(directory);
+        patch::trace_run("validate build inputs", started);
+        (cargo_outputs.join().unwrap_or(false), inputs_unchanged)
+    });
+    let inputs_unchanged = inputs_unchanged?;
+    if env::var_os(TRACE_RUN).is_some() {
+        eprintln!(
+            "    Cinder trace: validation Cargo-outputs={cargo_outputs_unchanged} inputs={inputs_unchanged}"
+        );
+    }
+    Ok(cargo_outputs_unchanged && inputs_unchanged)
 }
 
 fn short_digest(bytes: &[u8]) -> String {
@@ -370,17 +526,20 @@ fn try_fast_build_locked(
     directory: &Path,
     build_context: &[u8],
     target_lock_path: &Path,
+    decision_started: Instant,
 ) -> Result<bool, String> {
+    let mut history_probes = HistoryProbeCache::default();
+    let stage_started = Instant::now();
     let current = State::load(directory, StateKind::Build)?;
-    if env::var_os("CINDER_TRACE_RUN").is_some() {
+    patch::trace_run("load current build state", stage_started);
+    if env::var_os(TRACE_RUN).is_some() {
         if let Some(state) = current.as_ref() {
             eprintln!(
-                "    Cinder trace: locked build context={} target={} artifact={} cargo-outputs={}",
+                "    Cinder trace: locked build context={} target={} artifact={} cargo-outputs=deferred",
                 state.context_matches(build_context),
                 cargo_target_lock_path(&state.public_artifact)
                     .is_ok_and(|path| path == target_lock_path),
-                state.artifact_is_unchanged().unwrap_or(false),
-                state.cargo_outputs_are_available()
+                state.artifact_is_unchanged().unwrap_or(false)
             );
         }
     }
@@ -389,19 +548,25 @@ fn try_fast_build_locked(
             && cargo_target_lock_path(&state.public_artifact)
                 .is_ok_and(|path| path == target_lock_path)
             && state.artifact_is_unchanged().unwrap_or(false)
-            && state.cargo_outputs_are_available()
     }) {
+        let stage_started = Instant::now();
         let change = if artifact_is_executable(&state.public_artifact) {
             find_literal_change(directory, &state.snapshot, &state.sources)?
         } else {
             None
         };
+        patch::trace_run("inspect build literal change", stage_started);
         if let Some(change) = change {
-            if state.inputs_are_unchanged(directory)? {
+            if cargo_outputs_and_inputs_are_unchanged(&state, directory)? {
                 if let Some(patched) =
                     patch_artifact(directory, &state, &change, PatchMode::BuildInPlace)?
                 {
                     state.record_patched(directory, StateKind::Build, &patched, &change, false)?;
+                    crate::usage::record(
+                        crate::usage::CommandKind::Build,
+                        crate::usage::Outcome::BinaryPatch,
+                        decision_started.elapsed(),
+                    );
                     eprintln!(
                         "    Cinder patched {} into {} without recompiling",
                         change.relative.display(),
@@ -411,14 +576,26 @@ fn try_fast_build_locked(
                 }
             }
         } else {
-            let sources_unchanged = state.sources_match_revision(directory)?;
-            let inputs_unchanged = state.inputs_are_unchanged(directory)?;
-            if env::var_os("CINDER_TRACE_RUN").is_some() {
+            let stage_started = Instant::now();
+            let sources_unchanged =
+                history_probes.source_digest(directory, &state.sources)? == state.source_digest;
+            patch::trace_run("validate current build sources", stage_started);
+            let inputs_unchanged = if sources_unchanged {
+                cargo_outputs_and_inputs_are_unchanged(&state, directory)?
+            } else {
+                false
+            };
+            if env::var_os(TRACE_RUN).is_some() {
                 eprintln!(
                     "    Cinder trace: locked build sources={sources_unchanged} inputs={inputs_unchanged}"
                 );
             }
             if sources_unchanged && inputs_unchanged {
+                crate::usage::record(
+                    crate::usage::CommandKind::Build,
+                    crate::usage::Outcome::CurrentReuse,
+                    decision_started.elapsed(),
+                );
                 eprintln!(
                     "    Cinder reused {} without invoking Cargo",
                     state.artifact.display()
@@ -428,17 +605,25 @@ fn try_fast_build_locked(
         }
     }
 
-    let Some(historical) = State::matching_history(
+    let stage_started = Instant::now();
+    let historical = State::matching_history(
         directory,
         StateKind::Build,
         build_context,
         Some(target_lock_path),
-    )?
-    else {
+        &mut history_probes,
+    )?;
+    patch::trace_run("search build revision history", stage_started);
+    let Some(historical) = historical else {
         return Ok(false);
     };
     let restored = restore_cached_build_artifact(directory, &historical)?;
     historical.promote(directory, StateKind::Build, &restored, false)?;
+    crate::usage::record(
+        crate::usage::CommandKind::Build,
+        crate::usage::Outcome::RevisionRestore,
+        decision_started.elapsed(),
+    );
     eprintln!(
         "    Cinder restored a validated previous build of {} without invoking Cargo",
         restored.display()
@@ -730,9 +915,12 @@ fn restore_cached_build_artifact(directory: &Path, historical: &State) -> Result
 }
 
 pub fn run_artifact(mut arguments: Vec<OsString>) -> Result<u8, String> {
-    if arguments.is_empty() {
-        return Err("artifact runner requires an executable path".to_owned());
+    if arguments.len() < 3 {
+        return Err("artifact runner requires context, receipts, and executable paths".to_owned());
     }
+    let context_path = PathBuf::from(arguments.remove(0));
+    let receipt_directory = PathBuf::from(arguments.remove(0));
+    messages::wait_for_runner_receipts(&receipt_directory)?;
     let artifact = absolute_path(Path::new(&arguments.remove(0)))?;
     let program_name = artifact
         .file_name()
@@ -743,9 +931,17 @@ pub fn run_artifact(mut arguments: Vec<OsString>) -> Result<u8, String> {
             .map_err(|error| format!("could not inspect current directory: {error}"))?,
     )
     .map_err(|error| format!("could not resolve current directory: {error}"))?;
-    let run_context = take_run_context();
+    let run_context = fs::read(&context_path)
+        .map_err(|error| format!("could not read Cinder run context: {error}"));
+    let _ = fs::remove_file(&context_path);
     if let Err(error) = run_context.and_then(|run_context| {
-        schedule_run_state(&directory, &artifact, &program_name, &run_context)
+        schedule_run_state(
+            &directory,
+            &artifact,
+            &program_name,
+            &run_context,
+            Some(receipt_directory),
+        )
     }) {
         eprintln!("cinder: could not prepare the next fast run: {error}");
     }
@@ -753,13 +949,203 @@ pub fn run_artifact(mut arguments: Vec<OsString>) -> Result<u8, String> {
     exec_artifact(&artifact, &program_name, arguments.iter(), &[])
 }
 
+/// Cargo target runner used only for one explicitly selected standard library
+/// test. The test always runs, even when state capture is unavailable. A
+/// successful execution can establish the next exact fast-test baseline.
+pub fn run_test_artifact(mut arguments: Vec<OsString>) -> Result<u8, String> {
+    if arguments.len() < 5 {
+        return Err(
+            "test artifact runner requires context, receipts, project, recording mode, and executable paths".to_owned(),
+        );
+    }
+    let context_path = PathBuf::from(arguments.remove(0));
+    let receipt_directory = PathBuf::from(arguments.remove(0));
+    let project_directory = PathBuf::from(arguments.remove(0));
+    let synchronous_recording = match arguments.remove(0).to_str() {
+        Some("sync") => true,
+        Some("async") => false,
+        _ => return Err("test artifact runner received an invalid recording mode".to_owned()),
+    };
+    let artifact = absolute_path(Path::new(&arguments.remove(0)))?;
+    let program_name = artifact
+        .file_name()
+        .ok_or_else(|| {
+            format!(
+                "Cargo test artifact has no file name: {}",
+                artifact.display()
+            )
+        })?
+        .to_owned();
+    let receipts_ready = messages::wait_for_runner_receipts(&receipt_directory);
+    let project_directory = fs::canonicalize(&project_directory);
+    let runtime_directory = canonical_current_directory();
+    let test_context = fs::read(&context_path);
+
+    let status = test_command(&artifact, arguments.iter(), None, None)
+        .status()
+        .map_err(|error| {
+            format!(
+                "could not execute Cargo test {}: {error}",
+                artifact.display()
+            )
+        })?;
+    if status.success() {
+        let recording = receipts_ready
+            .map_err(|error| format!("Cargo test receipts were unavailable: {error}"))
+            .and_then(|()| matching_test_artifact_receipt(&receipt_directory, &artifact))
+            .and_then(|receipt| {
+                receipt.ok_or_else(|| "Cargo produced no exact test artifact receipt".to_owned())
+            })
+            .and_then(|receipt| {
+                let project_directory = project_directory
+                    .map_err(|error| format!("could not resolve test project: {error}"))?;
+                let runtime_directory = runtime_directory.map_err(|error| {
+                    format!("could not resolve test working directory: {error}")
+                })?;
+                let manifest_directory = receipt
+                    .manifest_directory
+                    .as_deref()
+                    .ok_or_else(|| "Cargo test receipt has no package manifest".to_owned())?;
+                let manifest_directory = fs::canonicalize(manifest_directory).map_err(|error| {
+                    format!("could not resolve Cargo test package directory: {error}")
+                })?;
+                if runtime_directory != manifest_directory {
+                    return Err(
+                        "Cargo test working directory did not match the selected package"
+                            .to_owned(),
+                    );
+                }
+                if !manifest_has_standard_library_test_harness_at(&runtime_directory)? {
+                    return Err("Cargo selected a nonstandard library test harness".to_owned());
+                }
+                let test_context = test_context
+                    .map_err(|error| format!("could not read Cinder test context: {error}"))?;
+                schedule_test_execution_state(
+                    &project_directory,
+                    &runtime_directory,
+                    &artifact,
+                    &program_name,
+                    &test_context,
+                    Some(receipt_directory.clone()),
+                    synchronous_recording,
+                )
+            });
+        if let Err(error) = recording {
+            let _ = fs::remove_dir_all(&receipt_directory);
+            eprintln!("cinder: could not prepare the next fast test execution: {error}");
+        }
+    }
+    let _ = fs::remove_file(context_path);
+    child_status(status)
+}
+
+fn schedule_test_execution_state(
+    directory: &Path,
+    runtime_directory: &Path,
+    artifact: &Path,
+    program_name: &OsStr,
+    test_context: &[u8],
+    receipt_directory: Option<PathBuf>,
+    synchronous: bool,
+) -> Result<(), String> {
+    if synchronous {
+        let receipt = receipt_directory
+            .as_deref()
+            .map(|directory| matching_test_artifact_receipt(directory, artifact))
+            .transpose()?
+            .flatten()
+            .ok_or_else(|| "Cargo produced no exact test artifact receipt".to_owned())?;
+        let result = State::record_fresh_test_execution(
+            directory,
+            artifact,
+            program_name,
+            test_context,
+            &receipt,
+            runtime_directory,
+        );
+        if let Some(directory) = receipt_directory {
+            let _ = fs::remove_dir_all(directory);
+        }
+        return result;
+    }
+    let root = env::temp_dir().join("cinder").join("recordings");
+    fs::create_dir_all(&root)
+        .map_err(|error| format!("could not create state recording directory: {error}"))?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "system clock predates the Unix epoch".to_owned())?
+        .as_nanos();
+    let context_path = root.join(format!("test-{}-{nonce}", std::process::id()));
+    fs::write(&context_path, test_context)
+        .map_err(|error| format!("could not stage test state context: {error}"))?;
+    let cinder = env::current_exe()
+        .and_then(fs::canonicalize)
+        .map_err(|error| format!("could not identify the Cinder executable: {error}"))?;
+    let mut command = Command::new(cinder);
+    command
+        .arg("__record-test-execution")
+        .arg(artifact)
+        .arg(program_name)
+        .arg(&context_path)
+        .arg(runtime_directory)
+        .current_dir(directory)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(receipt_directory) = receipt_directory {
+        command.arg(receipt_directory);
+    }
+    match command.spawn() {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            let _ = fs::remove_file(&context_path);
+            Err(format!("could not start the test state recorder: {error}"))
+        }
+    }
+}
+
+pub fn record_test_execution_state_command(arguments: &[OsString]) -> Result<u8, String> {
+    if !(4..=5).contains(&arguments.len()) {
+        return Err(
+            "test execution recorder requires artifact, program, context, runtime directory, and optional receipts".to_owned(),
+        );
+    }
+    let artifact = &arguments[0];
+    let program_name = &arguments[1];
+    let context_path = &arguments[2];
+    let runtime_directory = &arguments[3];
+    let receipt_directory = arguments.get(4).map(PathBuf::from);
+    let context = fs::read(context_path)
+        .map_err(|error| format!("could not read test state context: {error}"))?;
+    let directory = canonical_current_directory()?;
+    let receipt = receipt_directory
+        .as_deref()
+        .map(|directory| matching_test_artifact_receipt(directory, Path::new(artifact)))
+        .transpose()?
+        .flatten()
+        .ok_or_else(|| "Cargo produced no exact test artifact receipt".to_owned())?;
+    let result = State::record_fresh_test_execution(
+        &directory,
+        Path::new(artifact),
+        program_name,
+        &context,
+        &receipt,
+        Path::new(runtime_directory),
+    );
+    let _ = fs::remove_file(context_path);
+    if let Some(directory) = receipt_directory {
+        let _ = fs::remove_dir_all(directory);
+    }
+    result.map(|()| 0)
+}
+
 fn schedule_run_state(
     directory: &Path,
     artifact: &Path,
     program_name: &OsStr,
     run_context: &[u8],
+    receipt_directory: Option<PathBuf>,
 ) -> Result<(), String> {
-    let receipt_directory = env::var_os(ARTIFACT_RECEIPT_DIRECTORY).map(PathBuf::from);
     if env::var_os(SYNCHRONOUS_STATE_RECORDING).is_some() {
         let receipt = receipt_directory
             .as_deref()
@@ -866,6 +1252,27 @@ fn matching_artifact_receipt(
     }
 }
 
+fn matching_test_artifact_receipt(
+    directory: &Path,
+    artifact: &Path,
+) -> Result<Option<ArtifactReceipt>, String> {
+    let artifact = absolute_path(artifact)?;
+    let mut matching = Vec::new();
+    for receipt in read_artifact_receipts(directory)? {
+        if absolute_path(&receipt.artifact).ok().as_deref() == Some(artifact.as_path()) {
+            matching.push(receipt);
+        }
+    }
+    match matching.len() {
+        0 => Ok(None),
+        1 => Ok(matching.pop()),
+        _ => Err(format!(
+            "compiler artifact receipt is ambiguous for test {}",
+            artifact.display()
+        )),
+    }
+}
+
 pub fn record_completed_build(
     receipt_directory: &Path,
     build_context: &[u8],
@@ -882,7 +1289,7 @@ pub fn record_completed_build(
             artifacts.entry(artifact).or_insert(receipt);
         }
         if artifacts.len() != 1 {
-            if env::var_os("CINDER_TRACE_RUN").is_some() {
+            if env::var_os(TRACE_RUN).is_some() {
                 eprintln!(
                     "    Cinder trace: expected one executable receipt, found {}",
                     artifacts.len()
@@ -927,7 +1334,7 @@ pub fn record_completed_check(
             artifacts.entry(receipt.artifact.clone()).or_insert(receipt);
         }
         if artifacts.len() != 1 {
-            if env::var_os("CINDER_TRACE_RUN").is_some() {
+            if env::var_os(TRACE_RUN).is_some() {
                 eprintln!(
                     "    Cinder trace: expected one check receipt, found {}",
                     artifacts.len()
@@ -974,7 +1381,7 @@ pub fn record_completed_test(
             artifacts.entry(receipt.artifact.clone()).or_insert(receipt);
         }
         if artifacts.len() != 1 {
-            if env::var_os("CINDER_TRACE_RUN").is_some() {
+            if env::var_os(TRACE_RUN).is_some() {
                 eprintln!(
                     "    Cinder trace: expected one test receipt, found {}",
                     artifacts.len()
@@ -1135,7 +1542,12 @@ fn read_artifact_receipts(directory: &Path) -> Result<Vec<ArtifactReceipt>, Stri
             .map_err(|error| format!("could not inspect artifact receipt: {error}"))?
             .path();
         if path.extension() == Some("receipt".as_ref()) {
-            receipts.push(read_artifact_receipt(&path)?);
+            let mut receipt = read_artifact_receipt(&path)?;
+            let recipe = path.with_extension("recipe");
+            if recipe.is_file() {
+                receipt.compiler_recipe = read_compiler_recipe(&recipe).ok();
+            }
+            receipts.push(receipt);
         }
     }
     Ok(receipts)
@@ -1180,16 +1592,6 @@ fn public_artifact(receipt: &ArtifactReceipt) -> Result<PathBuf, String> {
     }
 }
 
-fn take_run_context() -> Result<Vec<u8>, String> {
-    let path = env::var_os(RUN_CONTEXT_FILE)
-        .map(PathBuf::from)
-        .ok_or_else(|| "Cargo did not provide a Cinder run context".to_owned())?;
-    let context =
-        fs::read(&path).map_err(|error| format!("could not read Cinder run context: {error}"))?;
-    let _ = fs::remove_file(path);
-    Ok(context)
-}
-
 fn absolute_path(path: &Path) -> Result<PathBuf, String> {
     let path = if path.is_absolute() {
         path.to_owned()
@@ -1213,6 +1615,74 @@ fn runtime_arguments(arguments: &[OsString]) -> impl Iterator<Item = &OsString> 
         .skip(1)
 }
 
+fn run_validated_test<'a>(
+    artifact: &Path,
+    arguments: impl IntoIterator<Item = &'a OsString>,
+    runtime_environment: &[(OsString, OsString)],
+    runtime_directory: &Path,
+) -> Result<u8, String> {
+    let status = test_command(
+        artifact,
+        arguments,
+        Some(runtime_environment),
+        Some(runtime_directory),
+    )
+    .status()
+    .map_err(|error| {
+        format!(
+            "could not execute validated test {}: {error}",
+            artifact.display()
+        )
+    })?;
+    if status.success() {
+        return Ok(0);
+    }
+    eprintln!("error: test failed, to rerun pass `--lib`");
+    Ok(101)
+}
+
+fn test_command<'a>(
+    artifact: &Path,
+    arguments: impl IntoIterator<Item = &'a OsString>,
+    runtime_environment: Option<&[(OsString, OsString)]>,
+    runtime_directory: Option<&Path>,
+) -> Command {
+    let mut command = Command::new(artifact);
+    command.args(arguments);
+    if let Some(runtime_directory) = runtime_directory {
+        command.current_dir(runtime_directory);
+    }
+    if let Some(runtime_environment) = runtime_environment {
+        for key in RUNTIME_LINKER_ENVIRONMENT_KEYS {
+            command.env_remove(key);
+        }
+        command.envs(runtime_environment.iter().map(|(key, value)| (key, value)));
+    }
+    crate::command::restore_runtime_environment(&mut command);
+    command
+}
+
+fn child_status(status: std::process::ExitStatus) -> Result<u8, String> {
+    if let Some(code) = status.code() {
+        return Ok(code.clamp(0, u8::MAX as i32) as u8);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+
+        if let Some(signal) = status.signal() {
+            // SAFETY: the child terminated from this signal. Restoring the
+            // default disposition and raising it gives Cargo the same runner
+            // termination class it would have observed from the test itself.
+            unsafe {
+                libc::signal(signal, libc::SIG_DFL);
+                libc::raise(signal);
+            }
+        }
+    }
+    Err("Cargo test process ended without an exit code".to_owned())
+}
+
 fn exec_artifact<'a>(
     artifact: &Path,
     program_name: &OsStr,
@@ -1222,7 +1692,6 @@ fn exec_artifact<'a>(
     let mut command = Command::new(artifact);
     command.args(arguments);
     command.arg0(program_name);
-    command.env(DISABLE_FAST_RUN, "1");
     command.envs(runtime_environment.iter().map(|(key, value)| (key, value)));
     crate::command::restore_runtime_environment(&mut command);
     let error = command.exec();

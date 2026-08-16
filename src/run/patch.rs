@@ -223,7 +223,7 @@ pub(super) fn code_signature_metadata_matches(
 }
 
 pub(super) fn trace_run(stage: &str, started: Instant) {
-    if env::var_os("CINDER_TRACE_RUN").is_some() {
+    if env::var_os(super::TRACE_RUN).is_some() {
         eprintln!(
             "    Cinder trace: {stage} {:.3}s",
             started.elapsed().as_secs_f64()

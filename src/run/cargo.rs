@@ -7,13 +7,43 @@ use super::{
 };
 
 pub fn artifact_capture_eligible(arguments: &[OsString]) -> Result<bool, String> {
-    match cargo_subcommand(arguments) {
+    let eligible = match cargo_subcommand(arguments) {
         Some("run" | "r") => eligible(arguments),
         Some("build" | "b") => build_eligible(arguments),
         Some("check" | "c") => check_eligible(arguments),
         Some("test" | "t") => test_eligible(arguments),
         _ => Ok(false),
+    }?;
+    if !eligible {
+        return Ok(false);
     }
+    // Cargo searches parent directories for a manifest, but Cinder's state and
+    // topology are deliberately rooted at the invocation directory. Capturing
+    // from a descendant could omit sibling auto-targets, so keep those command
+    // shapes entirely Cargo-owned until state is rooted at Cargo's workspace.
+    if !env::current_dir()
+        .map_err(|error| format!("could not inspect the current directory: {error}"))?
+        .join("Cargo.toml")
+        .is_file()
+    {
+        return Ok(false);
+    }
+    Ok(!rustc_wrapper_is_configured()?)
+}
+
+pub fn rustc_wrapper_is_configured() -> Result<bool, String> {
+    if [
+        "RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+        "CARGO_BUILD_RUSTC_WRAPPER",
+        "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+    ]
+    .iter()
+    .any(|key| env::var_os(key).is_some())
+    {
+        return Ok(true);
+    }
+    cargo_config_may_set_rustc_wrapper()
 }
 
 pub(super) fn eligible(arguments: &[OsString]) -> Result<bool, String> {
@@ -49,7 +79,8 @@ pub(super) fn build_eligible(arguments: &[OsString]) -> Result<bool, String> {
     }
 
     let cargo_arguments = arguments.iter().filter_map(|argument| argument.to_str());
-    if primary_target_selector_count(arguments) > 1
+    if arguments.iter().any(|argument| argument == "--")
+        || primary_target_selector_count(arguments) > 1
         || cargo_arguments
             .clone()
             .any(|argument| unsupported_argument(argument) || unsupported_build_argument(argument))
@@ -70,7 +101,8 @@ pub(super) fn check_eligible(arguments: &[OsString]) -> Result<bool, String> {
         return Ok(false);
     }
 
-    if primary_target_selector_count(arguments) > 1
+    if arguments.iter().any(|argument| argument == "--")
+        || primary_target_selector_count(arguments) > 1
         || arguments
             .iter()
             .filter_map(|argument| argument.to_str())
@@ -126,12 +158,13 @@ pub(super) fn test_eligible(arguments: &[OsString]) -> Result<bool, String> {
         .iter()
         .take_while(|argument| argument.as_os_str() != "--")
         .collect();
+    let builds_only = cargo_arguments
+        .iter()
+        .any(|argument| argument.as_os_str() == "--no-run");
     if !cfg!(target_os = "macos")
         || env::var_os(DISABLE_FAST_TEST).is_some()
         || !matches!(cargo_subcommand(arguments), Some("test" | "t"))
-        || !cargo_arguments
-            .iter()
-            .any(|argument| argument.as_os_str() == "--no-run")
+        || (builds_only && arguments.iter().any(|argument| argument == "--"))
     {
         return Ok(false);
     }
@@ -143,10 +176,145 @@ pub(super) fn test_eligible(arguments: &[OsString]) -> Result<bool, String> {
             .filter_map(|argument| argument.as_os_str().to_str())
             .any(|argument| unsupported_argument(argument) || unsupported_test_argument(argument))
         || env::var_os("CARGO_BUILD_TARGET").is_some()
+        || env::vars_os().any(|(key, _)| runner_environment_key(&key))
+        || cargo_config_may_change_runner_or_target()?
     {
         return Ok(false);
     }
+    if !builds_only && !test_execution_arguments_supported(arguments)? {
+        return Ok(false);
+    }
     Ok(true)
+}
+
+pub fn test_execution_eligible(arguments: &[OsString]) -> Result<bool, String> {
+    Ok(test_eligible(arguments)? && test_executes(arguments))
+}
+
+pub(super) fn test_executes(arguments: &[OsString]) -> bool {
+    !arguments
+        .iter()
+        .take_while(|argument| argument.as_os_str() != "--")
+        .any(|argument| argument.as_os_str() == "--no-run")
+}
+
+/// Keeps direct test execution deliberately narrower than test-build reuse.
+///
+/// Cinder currently runs only one explicitly selected standard library test
+/// harness. Named targets can carry `harness = false`, integration tests receive
+/// additional runtime environment, and a positional pre-delimiter filter
+/// requires Cargo argument parsing. Those shapes stay Cargo-owned until their
+/// complete launch contract is recorded.
+fn test_execution_arguments_supported(arguments: &[OsString]) -> Result<bool, String> {
+    let Some(command_index) = cargo_subcommand_index(arguments) else {
+        return Ok(false);
+    };
+
+    let mut saw_library = false;
+    let mut saw_package = false;
+    let mut index = command_index + 1;
+    while index < arguments.len() {
+        let argument = arguments[index].as_os_str();
+        if argument == "--" {
+            break;
+        }
+        let Some(argument) = argument.to_str() else {
+            return Ok(false);
+        };
+        match argument {
+            "--lib" if !saw_library => {
+                saw_library = true;
+                index += 1;
+            }
+            "--locked"
+            | "--offline"
+            | "--frozen"
+            | "--all-features"
+            | "--no-default-features"
+            | "--ignore-rust-version"
+            | "--no-fail-fast" => {
+                index += 1;
+            }
+            "--features" | "-F" | "--jobs" | "-j" | "--target-dir" => {
+                let Some(value) = arguments.get(index + 1) else {
+                    return Ok(false);
+                };
+                if value.is_empty() || value == "--" {
+                    return Ok(false);
+                }
+                index += 2;
+            }
+            "--package" | "-p" if !saw_package => {
+                let Some(value) = arguments.get(index + 1) else {
+                    return Ok(false);
+                };
+                if value.is_empty() || value == "--" {
+                    return Ok(false);
+                }
+                saw_package = true;
+                index += 2;
+            }
+            _ if !saw_package
+                && argument
+                    .strip_prefix("--package=")
+                    .is_some_and(|value| !value.is_empty()) =>
+            {
+                saw_package = true;
+                index += 1;
+            }
+            _ if argument
+                .strip_prefix("--features=")
+                .is_some_and(|value| !value.is_empty())
+                || argument
+                    .strip_prefix("--jobs=")
+                    .is_some_and(|value| !value.is_empty())
+                || argument
+                    .strip_prefix("--target-dir=")
+                    .is_some_and(|value| !value.is_empty())
+                || (argument.starts_with("-F") && argument.len() > 2)
+                || (argument.starts_with("-j") && argument.len() > 2) =>
+            {
+                index += 1;
+            }
+            _ => return Ok(false),
+        }
+    }
+    Ok(saw_library)
+}
+
+fn manifest_has_standard_library_test_harness(manifest: &toml::Table) -> bool {
+    manifest.get("package").is_some_and(toml::Value::is_table)
+        && manifest
+            .get("lib")
+            .and_then(toml::Value::as_table)
+            .and_then(|library| library.get("harness"))
+            .and_then(toml::Value::as_bool)
+            != Some(false)
+}
+
+pub(super) fn manifest_has_standard_library_test_harness_at(
+    directory: &Path,
+) -> Result<bool, String> {
+    let manifest = directory.join("Cargo.toml");
+    match fs::metadata(&manifest) {
+        Ok(metadata) if metadata.is_file() && metadata.len() <= 4 * 1_048_576 => {}
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("could not inspect Cargo.toml: {error}")),
+    }
+    let contents = fs::read_to_string(&manifest)
+        .map_err(|error| format!("could not read Cargo.toml: {error}"))?;
+    let manifest = toml::from_str::<toml::Table>(&contents)
+        .map_err(|error| format!("could not parse Cargo.toml: {error}"))?;
+    Ok(manifest_has_standard_library_test_harness(&manifest))
+}
+
+#[cfg(test)]
+pub(super) fn manifest_contents_have_standard_library_test_harness(
+    contents: &str,
+) -> Result<bool, toml::de::Error> {
+    toml::from_str::<toml::Table>(contents)
+        .map(|manifest| manifest_has_standard_library_test_harness(&manifest))
 }
 
 pub(super) fn unsupported_test_argument(argument: &str) -> bool {
@@ -336,6 +504,28 @@ pub(super) fn canonical_current_directory() -> Result<PathBuf, String> {
 pub(super) fn unsupported_argument(argument: &str) -> bool {
     argument == "--release"
         || argument == "-r"
+        || matches!(
+            argument,
+            "-h" | "--help"
+                | "-v"
+                | "--verbose"
+                | "-q"
+                | "--quiet"
+                | "--future-incompat-report"
+                | "--timings"
+                | "--unit-graph"
+                | "--build-plan"
+        )
+        || argument.strip_prefix('-').is_some_and(|flags| {
+            flags.len() > 1
+                && (flags.bytes().all(|flag| flag == b'v')
+                    || flags.bytes().all(|flag| flag == b'q'))
+        })
+        || argument == "--color"
+        || argument.starts_with("--color=")
+        || argument.starts_with("--timings=")
+        || argument == "--lockfile-path"
+        || argument.starts_with("--lockfile-path=")
         || argument == "--target"
         || argument.starts_with("--target=")
         || argument == "--profile"
@@ -356,6 +546,37 @@ pub(super) fn runner_environment_key(key: &OsStr) -> bool {
 }
 
 pub(super) fn cargo_config_may_change_runner_or_target() -> Result<bool, String> {
+    cargo_config_may_change(|config| {
+        let build_target = config
+            .get("build")
+            .and_then(toml::Value::as_table)
+            .is_some_and(|build| build.contains_key("target"));
+        let target_runner = config
+            .get("target")
+            .and_then(toml::Value::as_table)
+            .is_some_and(|targets| {
+                targets.values().any(|target| {
+                    target
+                        .as_table()
+                        .is_some_and(|target| target.contains_key("runner"))
+                })
+            });
+        build_target || target_runner
+    })
+}
+
+fn cargo_config_may_set_rustc_wrapper() -> Result<bool, String> {
+    cargo_config_may_change(|config| {
+        config
+            .get("build")
+            .and_then(toml::Value::as_table)
+            .is_some_and(|build| {
+                build.contains_key("rustc-wrapper") || build.contains_key("rustc-workspace-wrapper")
+            })
+    })
+}
+
+fn cargo_config_may_change(predicate: impl Fn(&toml::Table) -> bool) -> Result<bool, String> {
     let mut directories = Vec::new();
     let mut directory = env::current_dir()
         .map_err(|error| format!("could not inspect the current directory: {error}"))?;
@@ -384,12 +605,13 @@ pub(super) fn cargo_config_may_change_runner_or_target() -> Result<bool, String>
                     ));
                 }
             };
-            if cargo_config_contents_may_change_runner_or_target(&contents).map_err(|error| {
+            let config = toml::from_str::<toml::Table>(&contents).map_err(|error| {
                 format!(
                     "could not parse Cargo configuration {}: {error}",
                     path.display()
                 )
-            })? {
+            })?;
+            if predicate(&config) {
                 return Ok(true);
             }
         }
@@ -397,6 +619,7 @@ pub(super) fn cargo_config_may_change_runner_or_target() -> Result<bool, String>
     Ok(false)
 }
 
+#[cfg(test)]
 pub(super) fn cargo_config_contents_may_change_runner_or_target(
     contents: &str,
 ) -> Result<bool, String> {
@@ -416,6 +639,17 @@ pub(super) fn cargo_config_contents_may_change_runner_or_target(
             })
         });
     Ok(build_target || target_runner)
+}
+
+#[cfg(test)]
+pub(super) fn cargo_config_contents_may_set_rustc_wrapper(contents: &str) -> Result<bool, String> {
+    let config = toml::from_str::<toml::Table>(contents).map_err(|error| error.to_string())?;
+    Ok(config
+        .get("build")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|build| {
+            build.contains_key("rustc-wrapper") || build.contains_key("rustc-workspace-wrapper")
+        }))
 }
 
 pub(super) fn host_target() -> Result<String, String> {

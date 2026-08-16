@@ -1,26 +1,37 @@
 //! Compiler receipt capture and Cargo argument normalization.
 
 use super::{
-    ARTIFACT_RECEIPT_DIRECTORY, ArtifactReceipt, OsStr, OsString, PathBuf, StateKind, SystemTime,
-    UNIX_EPOCH, eligible, env, fs, host_target, make_private_directory, state_directory,
-    toml_string, write_artifact_receipt,
+    OsStr, OsString, Path, PathBuf, StateKind, SystemTime, UNIX_EPOCH, eligible, env, fs,
+    host_target, make_private_directory, state_directory, test_execution_eligible, toml_string,
 };
 
 pub fn stage_run_context(context: &[u8]) -> Result<PathBuf, String> {
+    stage_execution_context(context, StateKind::Run, "run")
+}
+
+pub fn stage_test_context(context: &[u8]) -> Result<PathBuf, String> {
+    stage_execution_context(context, StateKind::Test, "test")
+}
+
+fn stage_execution_context(
+    context: &[u8],
+    kind: StateKind,
+    label: &str,
+) -> Result<PathBuf, String> {
     let directory = fs::canonicalize(
         env::current_dir()
             .map_err(|error| format!("could not inspect current directory: {error}"))?,
     )
     .map_err(|error| format!("could not resolve current directory: {error}"))?;
-    let root = state_directory(&directory, StateKind::Run);
+    let root = state_directory(&directory, kind);
     let parent = root
         .parent()
         .ok_or_else(|| "Cinder state directory has no parent".to_owned())?;
     fs::create_dir_all(parent)
         .map_err(|error| format!("could not create Cinder context directory: {error}"))?;
-    let path = parent.join(format!("run-context-{}", std::process::id()));
+    let path = parent.join(format!("{label}-context-{}", std::process::id()));
     fs::write(&path, context)
-        .map_err(|error| format!("could not stage Cinder run context: {error}"))?;
+        .map_err(|error| format!("could not stage Cinder {label} context: {error}"))?;
     Ok(path)
 }
 
@@ -37,93 +48,6 @@ pub fn stage_artifact_receipts() -> Result<PathBuf, String> {
         .map_err(|error| format!("could not stage Cinder artifact receipts: {error}"))?;
     make_private_directory(&directory)?;
     Ok(directory)
-}
-
-/// Records a primary binary produced by one wrapped rustc invocation.
-///
-/// Receipt failures never alter compiler success; the caller reports them as a
-/// disabled optimization and the next command continues through Cargo.
-pub fn record_artifact_receipt(arguments: &[OsString]) -> Result<(), String> {
-    if env::var_os("CARGO_PRIMARY_PACKAGE").as_deref() != Some("1".as_ref()) {
-        return Ok(());
-    }
-    let emits_link = rustc_list_options(arguments, "--emit")
-        .iter()
-        .any(|values| values.split(',').any(|value| value == "link"));
-    let emits_metadata = rustc_list_options(arguments, "--emit")
-        .iter()
-        .any(|values| values.split(',').any(|value| value == "metadata"));
-    if !emits_link && !emits_metadata {
-        return Ok(());
-    }
-    let is_test_harness = arguments.iter().any(|argument| argument == "--test");
-    let mut crate_types: Vec<_> = rustc_list_options(arguments, "--crate-type")
-        .into_iter()
-        .flat_map(|values| values.split(','))
-        .filter(|kind| {
-            matches!(
-                *kind,
-                "bin" | "lib" | "rlib" | "staticlib" | "dylib" | "cdylib"
-            )
-        })
-        .collect();
-    if crate_types.is_empty() && is_test_harness {
-        crate_types.push("bin");
-    }
-    let [crate_type] = crate_types.as_slice() else {
-        return Ok(());
-    };
-    if *crate_type == "bin" && env::var_os("CARGO_BIN_NAME").is_none() && !is_test_harness {
-        return Ok(());
-    }
-    let crate_name = rustc_option(arguments, "--crate-name")
-        .ok_or_else(|| "binary rustc invocation has no crate name".to_owned())?;
-    let out_directory = rustc_option(arguments, "--out-dir")
-        .map(PathBuf::from)
-        .ok_or_else(|| "binary rustc invocation has no output directory".to_owned())?;
-    let extra_filename = rustc_codegen_option(arguments, "extra-filename").unwrap_or_default();
-    let artifact = if emits_link {
-        out_directory.join(linked_artifact_name(
-            crate_name,
-            extra_filename,
-            crate_type,
-        )?)
-    } else {
-        out_directory.join(metadata_artifact_name(crate_name, extra_filename))
-    };
-    let mut dependency_name = OsString::from(crate_name);
-    dependency_name.push(extra_filename);
-    dependency_name.push(".d");
-    let dependency_file = out_directory.join(dependency_name);
-    if !artifact.is_file() {
-        return Err(format!(
-            "wrapped compiler did not produce {}",
-            artifact.display()
-        ));
-    }
-    let directory = env::var_os(ARTIFACT_RECEIPT_DIRECTORY)
-        .map(PathBuf::from)
-        .ok_or_else(|| "artifact receipt directory is not configured".to_owned())?;
-    let public_file_name = if emits_link && (*crate_type != "bin" || !is_test_harness) {
-        public_artifact_name(crate_name, crate_type)?
-    } else {
-        artifact
-            .file_name()
-            .ok_or_else(|| "metadata artifact has no file name".to_owned())?
-            .to_owned()
-    };
-    let receipt = ArtifactReceipt {
-        artifact,
-        dependency_file,
-        public_file_name,
-        crate_type: (*crate_type).to_owned(),
-        manifest_directory: env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from),
-        out_directory: env::var_os("OUT_DIR").map(PathBuf::from),
-    };
-    write_artifact_receipt(
-        &directory.join(format!("{}.receipt", std::process::id())),
-        &receipt,
-    )
 }
 
 pub(super) fn metadata_artifact_name(crate_name: &OsStr, extra_filename: &OsStr) -> OsString {
@@ -165,19 +89,6 @@ pub(super) fn linked_artifact_name(
         _ => return Err(format!("unsupported Cargo artifact type: {crate_type}")),
     }
     Ok(name)
-}
-
-pub(super) fn public_artifact_name(
-    crate_name: &OsStr,
-    crate_type: &str,
-) -> Result<OsString, String> {
-    if crate_type == "bin" {
-        let mut name = env::var_os("CARGO_BIN_NAME")
-            .ok_or_else(|| "binary Cargo target has no public name".to_owned())?;
-        name.push(env::consts::EXE_SUFFIX);
-        return Ok(name);
-    }
-    linked_artifact_name(crate_name, OsStr::new(""), crate_type)
 }
 
 pub(super) fn rustc_option<'a>(arguments: &'a [OsString], option: &str) -> Option<&'a OsStr> {
@@ -234,25 +145,88 @@ pub(super) fn rustc_codegen_option<'a>(
 /// Preserves Cargo's `run` implementation and replaces only its final target
 /// runner. Cargo therefore remains responsible for package/target selection,
 /// builds, diagnostics, dynamic-library paths, and the application environment.
-pub fn cargo_arguments(mut arguments: Vec<OsString>) -> Result<Vec<OsString>, String> {
-    if !eligible(&arguments)? {
-        return Ok(arguments);
+pub fn cargo_arguments(
+    mut arguments: Vec<OsString>,
+    context_path: Option<&Path>,
+    receipt_directory: Option<&Path>,
+    cargo_messages: bool,
+) -> Result<Vec<OsString>, String> {
+    let runner = if eligible(&arguments)? {
+        Some("__run-artifact")
+    } else if test_execution_eligible(&arguments)? {
+        Some("__run-test-artifact")
+    } else {
+        None
+    };
+    if env::var_os(super::TRACE_RUN).is_some() {
+        eprintln!(
+            "    Cinder trace: Cargo target runner={}",
+            runner.unwrap_or("disabled")
+        );
+    }
+    if let Some(runner_command) = runner {
+        let (Some(context_path), Some(receipt_directory)) = (context_path, receipt_directory)
+        else {
+            return Ok(arguments);
+        };
+        let target = host_target()?;
+        let cinder = env::current_exe()
+            .and_then(fs::canonicalize)
+            .map_err(|error| format!("could not identify the Cinder executable: {error}"))?;
+        let runner = if runner_command == "__run-test-artifact" {
+            let project = fs::canonicalize(
+                env::current_dir()
+                    .map_err(|error| format!("could not inspect current directory: {error}"))?,
+            )
+            .map_err(|error| format!("could not resolve current directory: {error}"))?;
+            let recording_mode = if env::var_os(super::SYNCHRONOUS_STATE_RECORDING).is_some() {
+                "sync"
+            } else {
+                "async"
+            };
+            format!(
+                "target.{target}.runner=[{},{},{},{},{},{}]",
+                toml_string(cinder.as_os_str())?,
+                toml_string(OsStr::new(runner_command))?,
+                toml_string(context_path.as_os_str())?,
+                toml_string(receipt_directory.as_os_str())?,
+                toml_string(project.as_os_str())?,
+                toml_string(OsStr::new(recording_mode))?,
+            )
+        } else {
+            format!(
+                "target.{target}.runner=[{},{},{},{}]",
+                toml_string(cinder.as_os_str())?,
+                toml_string(OsStr::new(runner_command))?,
+                toml_string(context_path.as_os_str())?,
+                toml_string(receipt_directory.as_os_str())?,
+            )
+        };
+        insert_cargo_config(&mut arguments, runner)?;
+    }
+    if cargo_messages {
+        insert_cargo_option(
+            &mut arguments,
+            OsString::from("--message-format=json-render-diagnostics"),
+        )?;
     }
 
-    let target = host_target()?;
-    let cinder = env::current_exe()
-        .and_then(fs::canonicalize)
-        .map_err(|error| format!("could not identify the Cinder executable: {error}"))?;
-    let runner = format!(
-        "target.{target}.runner=[{},\"__run-artifact\"]",
-        toml_string(cinder.as_os_str())?
-    );
-
-    let command_index = cargo_subcommand_index(&arguments)
-        .ok_or_else(|| "eligible Cargo run has no subcommand".to_owned())?;
-    arguments.insert(command_index + 1, OsString::from("--config"));
-    arguments.insert(command_index + 2, OsString::from(runner));
     Ok(arguments)
+}
+
+fn insert_cargo_option(arguments: &mut Vec<OsString>, value: OsString) -> Result<(), String> {
+    let command_index = cargo_subcommand_index(arguments)
+        .ok_or_else(|| "eligible Cargo command has no subcommand".to_owned())?;
+    arguments.insert(command_index + 1, value);
+    Ok(())
+}
+
+fn insert_cargo_config(arguments: &mut Vec<OsString>, value: String) -> Result<(), String> {
+    let command_index = cargo_subcommand_index(arguments)
+        .ok_or_else(|| "eligible Cargo command has no subcommand".to_owned())?;
+    arguments.insert(command_index + 1, OsString::from("--config"));
+    arguments.insert(command_index + 2, OsString::from(value));
+    Ok(())
 }
 
 pub fn cargo_subcommand(arguments: &[OsString]) -> Option<&str> {

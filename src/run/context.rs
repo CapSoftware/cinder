@@ -1,9 +1,9 @@
 //! Invocation, environment, compiler, and Cargo fingerprint identity.
 
 use super::{
-    BTreeMap, BTreeSet, CargoOutputs, DISABLE_FAST_BUILD, DISABLE_FAST_CHECK, DISABLE_FAST_RUN,
-    DISABLE_FAST_TEST, Digest, LaunchPolicy, OsStr, OsStrExt, OsString, OsStringExt, Path, PathBuf,
-    RUN_CONTEXT_FILE, Sha256, absolute_path, artifact_file_identity, env, fs, io,
+    BTreeMap, BTreeSet, CargoOutputEntry, CargoOutputs, Digest, LaunchPolicy, OsStr, OsStrExt,
+    OsString, OsStringExt, Path, PathBuf, Sha256, absolute_path, artifact_file_identity,
+    dependency_output_paths, env, fs, io,
 };
 
 #[cfg(test)]
@@ -23,7 +23,7 @@ pub fn run_context_with_cargo(
     cargo: &OsStr,
 ) -> Vec<u8> {
     let mut context = Sha256::new();
-    context.update(b"CINDER-RUN-CONTEXT-7");
+    context.update(b"CINDER-RUN-CONTEXT-9");
     context.update([launch_policy.context_byte()]);
     for argument in arguments
         .iter()
@@ -52,16 +52,7 @@ pub fn run_context_with_cargo(
 }
 
 pub(super) fn environment_affects_context(key: &OsStr) -> bool {
-    !matches!(
-        key.to_str(),
-        Some(
-            "_" | RUN_CONTEXT_FILE
-                | DISABLE_FAST_RUN
-                | DISABLE_FAST_BUILD
-                | DISABLE_FAST_CHECK
-                | DISABLE_FAST_TEST
-        )
-    )
+    key != "_" && !crate::usage::is_control_environment(key)
 }
 
 pub(super) fn bind_observed_shell_environment(
@@ -100,28 +91,12 @@ pub(super) fn dependency_observes_environment(path: &Path, key: &[u8]) -> Result
     }))
 }
 
-pub(super) fn encoded_dependency_observes_environment(
-    path: &Path,
-    key: &[u8],
-) -> Result<bool, String> {
-    let contents = fs::read(path).map_err(|error| {
-        format!(
-            "could not inspect Cargo environment dependencies {}: {error}",
-            path.display()
-        )
-    })?;
-    parse_encoded_dependency_environment(&contents, key).ok_or_else(|| {
-        format!(
-            "Cargo environment dependency data is invalid or unsupported: {}",
-            path.display()
-        )
-    })
+#[cfg(test)]
+pub(super) fn parse_encoded_dependency_environment(contents: &[u8], key: &[u8]) -> Option<bool> {
+    parse_encoded_dependency_data(contents, key).map(|(observed, _)| observed)
 }
 
-pub(super) fn parse_encoded_dependency_environment(
-    mut contents: &[u8],
-    key: &[u8],
-) -> Option<bool> {
+fn parse_encoded_dependency_data(mut contents: &[u8], key: &[u8]) -> Option<(bool, Vec<PathBuf>)> {
     let _marker_length = take_encoded_u32(&mut contents)?;
     if take_encoded_u8(&mut contents)? != u8::MAX || take_encoded_u8(&mut contents)? != 1 {
         return None;
@@ -130,11 +105,14 @@ pub(super) fn parse_encoded_dependency_environment(
     if file_count > contents.len() {
         return None;
     }
+    let mut paths = Vec::with_capacity(file_count);
     for _ in 0..file_count {
         if !matches!(take_encoded_u8(&mut contents)?, 0 | 1) {
             return None;
         }
-        take_encoded_bytes(&mut contents)?;
+        paths.push(PathBuf::from(OsString::from_vec(
+            take_encoded_bytes(&mut contents)?.to_vec(),
+        )));
         if take_encoded_u8(&mut contents)? != 0 {
             take_encoded_u64(&mut contents)?;
             take_encoded_bytes(&mut contents)?;
@@ -155,7 +133,7 @@ pub(super) fn parse_encoded_dependency_environment(
             _ => return None,
         }
     }
-    Some(observed)
+    contents.is_empty().then_some((observed, paths))
 }
 
 pub(super) fn take_encoded_u8(contents: &mut &[u8]) -> Option<u8> {
@@ -183,10 +161,10 @@ pub(super) fn take_encoded_bytes<'a>(contents: &mut &'a [u8]) -> Option<&'a [u8]
     Some(value)
 }
 
-pub(super) fn fingerprint_dependency_observes_environment(
+pub(super) fn fingerprint_dependency_data(
     fingerprint: &Path,
     key: &[u8],
-) -> Result<Option<bool>, String> {
+) -> Result<Option<(bool, Vec<PathBuf>)>, String> {
     let mut candidates = Vec::new();
     for entry in fs::read_dir(fingerprint).map_err(|error| {
         format!(
@@ -208,7 +186,22 @@ pub(super) fn fingerprint_dependency_observes_environment(
     }
     match candidates.as_slice() {
         [] => Ok(None),
-        [path] => encoded_dependency_observes_environment(path, key).map(Some),
+        [path] => {
+            let contents = fs::read(path).map_err(|error| {
+                format!(
+                    "could not inspect Cargo environment dependencies {}: {error}",
+                    path.display()
+                )
+            })?;
+            parse_encoded_dependency_data(&contents, key)
+                .map(Some)
+                .ok_or_else(|| {
+                    format!(
+                        "Cargo environment dependency data is invalid or unsupported: {}",
+                        path.display()
+                    )
+                })
+        }
         _ => Err(format!(
             "Cargo fingerprint has ambiguous dependency data: {}",
             fingerprint.display()
@@ -216,10 +209,20 @@ pub(super) fn fingerprint_dependency_observes_environment(
     }
 }
 
+pub(super) struct CompilerUnitGraph {
+    pub(super) observes_environment: bool,
+    pub(super) fingerprints: Vec<PathBuf>,
+    pub(super) dependency_files: Vec<PathBuf>,
+    pub(super) artifacts: Vec<PathBuf>,
+    pub(super) fingerprint_files: Vec<CargoOutputEntry>,
+    pub(super) encoded_dependency_paths: Vec<PathBuf>,
+    pub(super) build_script_directories: Vec<PathBuf>,
+}
+
 pub(super) fn compiler_unit_graph(
     outputs: &CargoOutputs,
     key: &[u8],
-) -> Result<(bool, Vec<PathBuf>), String> {
+) -> Result<CompilerUnitGraph, String> {
     let dependency_directory = outputs.dependency_file.parent().ok_or_else(|| {
         format!(
             "compiler dependency file has no parent directory: {}",
@@ -242,11 +245,49 @@ pub(super) fn compiler_unit_graph(
     let dependency_index = cargo_dependency_file_index(profile)?;
     let mut pending = vec![outputs.fingerprint.clone()];
     let mut visited = BTreeSet::new();
+    let mut dependency_files = BTreeSet::new();
+    let mut artifacts = BTreeSet::new();
+    let mut fingerprint_files = BTreeMap::new();
+    let mut encoded_dependency_paths = BTreeSet::new();
+    let mut build_script_directories = BTreeSet::new();
     let mut observed = false;
 
     while let Some(fingerprint) = pending.pop() {
         if !visited.insert(fingerprint.clone()) {
             continue;
+        }
+        for entry in fs::read_dir(&fingerprint).map_err(|error| {
+            format!(
+                "could not inspect Cargo fingerprint {}: {error}",
+                fingerprint.display()
+            )
+        })? {
+            let entry = entry.map_err(|error| {
+                format!(
+                    "could not inspect Cargo fingerprint {}: {error}",
+                    fingerprint.display()
+                )
+            })?;
+            let file_type = entry.file_type().map_err(|error| {
+                format!(
+                    "could not inspect Cargo fingerprint entry {}: {error}",
+                    entry.path().display()
+                )
+            })?;
+            if file_type.is_file() {
+                let path = fs::canonicalize(entry.path()).map_err(|error| {
+                    format!(
+                        "could not resolve Cargo fingerprint entry {}: {error}",
+                        entry.path().display()
+                    )
+                })?;
+                fingerprint_files.insert(path.clone(), artifact_file_identity(&path)?);
+            } else {
+                return Err(format!(
+                    "Cargo fingerprint contains an unsupported entry: {}",
+                    entry.path().display()
+                ));
+            }
         }
         let descriptor = cargo_fingerprint_descriptor(&fingerprint)?;
         let runs_build_script = descriptor
@@ -254,31 +295,65 @@ pub(super) fn compiler_unit_graph(
             .and_then(OsStr::to_str)
             .is_some_and(|name| name.starts_with("run-build-script-"));
         if runs_build_script {
-            let output = profile
-                .join("build")
-                .join(fingerprint.file_name().ok_or_else(|| {
+            let build_script_directory =
+                profile
+                    .join("build")
+                    .join(fingerprint.file_name().ok_or_else(|| {
+                        format!(
+                            "Cargo build-script fingerprint has no name: {}",
+                            fingerprint.display()
+                        )
+                    })?);
+            let build_script_directory =
+                fs::canonicalize(&build_script_directory).map_err(|error| {
                     format!(
-                        "Cargo build-script fingerprint has no name: {}",
-                        fingerprint.display()
+                        "could not resolve Cargo build-script output {}: {error}",
+                        build_script_directory.display()
                     )
-                })?)
-                .join("output");
+                })?;
+            let output = build_script_directory.join("output");
             observed |= build_script_output_observes_environment(&output, key)?;
+            artifacts.extend(cargo_unit_files(&build_script_directory, None)?);
+            build_script_directories.insert(build_script_directory);
         }
         let dependency_file = if fingerprint == outputs.fingerprint {
-            Some(outputs.dependency_file.as_path())
+            Some(outputs.dependency_file.clone())
         } else {
-            fingerprint
+            let indexed = fingerprint
                 .file_name()
                 .and_then(OsStr::to_str)
                 .and_then(|name| name.rsplit_once('-').map(|(_, hash)| hash))
-                .and_then(|hash| dependency_index.get(hash).map(PathBuf::as_path))
+                .and_then(|hash| dependency_index.get(hash).cloned());
+            match indexed {
+                Some(dependency_file) => Some(dependency_file),
+                None => cargo_unhashed_dependency_file(profile, &descriptor)?,
+            }
         };
-        if let Some(dependency_file) = dependency_file {
+        if let Some(dependency_file) = dependency_file.as_deref() {
             observed |= dependency_observes_environment(dependency_file, key)?;
+            let outputs = dependency_output_paths(dependency_file, profile)?;
+            if outputs.is_empty() {
+                return Err(format!(
+                    "Cargo unit dependency data names no compiler output: {}",
+                    dependency_file.display()
+                ));
+            }
+            artifacts.extend(outputs);
+            dependency_files.insert(dependency_file.to_owned());
         } else if !runs_build_script {
-            match fingerprint_dependency_observes_environment(&fingerprint, key)? {
-                Some(value) => observed |= value,
+            match fingerprint_dependency_data(&fingerprint, key)? {
+                Some((value, paths)) => {
+                    observed |= value;
+                    encoded_dependency_paths.extend(paths);
+                    let fingerprint_artifacts = cargo_unit_files(profile, Some(&fingerprint))?;
+                    if fingerprint_artifacts.is_empty() {
+                        return Err(format!(
+                            "Cargo unit has no discoverable compiler output: {}",
+                            fingerprint.display()
+                        ));
+                    }
+                    artifacts.extend(fingerprint_artifacts);
+                }
                 None => {
                     return Err(format!(
                         "Cargo unit has no dependency data: {}",
@@ -329,7 +404,143 @@ pub(super) fn compiler_unit_graph(
             pending.extend(dependencies.iter().cloned());
         }
     }
-    Ok((observed, visited.into_iter().collect()))
+    Ok(CompilerUnitGraph {
+        observes_environment: observed,
+        fingerprints: visited.into_iter().collect(),
+        dependency_files: dependency_files.into_iter().collect(),
+        artifacts: artifacts.into_iter().collect(),
+        fingerprint_files: fingerprint_files
+            .into_iter()
+            .map(|(path, identity)| CargoOutputEntry { path, identity })
+            .collect(),
+        encoded_dependency_paths: encoded_dependency_paths.into_iter().collect(),
+        build_script_directories: build_script_directories.into_iter().collect(),
+    })
+}
+
+fn cargo_unhashed_dependency_file(
+    profile: &Path,
+    descriptor: &Path,
+) -> Result<Option<PathBuf>, String> {
+    let Some(stem) = descriptor.file_stem().and_then(OsStr::to_str) else {
+        return Ok(None);
+    };
+    let Some(target_name) = [
+        "test-example-",
+        "test-bin-",
+        "test-lib-",
+        "example-",
+        "bin-",
+        "lib-",
+    ]
+    .into_iter()
+    .find_map(|prefix| stem.strip_prefix(prefix))
+    .filter(|name| !name.is_empty()) else {
+        return Ok(None);
+    };
+    let candidate = profile.join("deps").join(target_name).with_extension("d");
+    if !candidate.is_file() {
+        return Ok(None);
+    }
+    let candidate = fs::canonicalize(&candidate).map_err(|error| {
+        format!(
+            "could not resolve Cargo unhashed dependency file {}: {error}",
+            candidate.display()
+        )
+    })?;
+    if dependency_output_paths(&candidate, profile)?.is_empty() {
+        return Err(format!(
+            "Cargo unhashed dependency data names no compiler output: {}",
+            candidate.display()
+        ));
+    }
+    Ok(Some(candidate))
+}
+
+fn cargo_unit_files(
+    directory: &Path,
+    fingerprint: Option<&Path>,
+) -> Result<BTreeSet<PathBuf>, String> {
+    let mut outputs = BTreeSet::new();
+    if let Some(fingerprint) = fingerprint {
+        let fingerprint_name = fingerprint.file_name().ok_or_else(|| {
+            format!(
+                "Cargo fingerprint has no directory name: {}",
+                fingerprint.display()
+            )
+        })?;
+        let hash = fingerprint_name
+            .to_str()
+            .and_then(|name| name.rsplit_once('-').map(|(_, hash)| hash))
+            .filter(|hash| hash.len() == 16 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .ok_or_else(|| {
+                format!(
+                    "Cargo fingerprint has no unit hash: {}",
+                    fingerprint.display()
+                )
+            })?;
+        let dependencies = directory.join("deps");
+        for entry in fs::read_dir(&dependencies).map_err(|error| {
+            format!(
+                "could not inspect Cargo unit outputs {}: {error}",
+                dependencies.display()
+            )
+        })? {
+            let entry = entry.map_err(|error| {
+                format!(
+                    "could not inspect Cargo unit output in {}: {error}",
+                    dependencies.display()
+                )
+            })?;
+            let path = entry.path();
+            if !entry.file_type().is_ok_and(|kind| kind.is_file())
+                || path.extension() == Some(OsStr::new("d"))
+                || !path
+                    .file_stem()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|stem| stem.ends_with(&format!("-{hash}")))
+            {
+                continue;
+            }
+            outputs.insert(fs::canonicalize(&path).map_err(|error| {
+                format!(
+                    "could not resolve Cargo unit output {}: {error}",
+                    path.display()
+                )
+            })?);
+        }
+        let build = directory.join("build").join(fingerprint_name);
+        if build.is_dir() {
+            outputs.extend(cargo_unit_files(&build, None)?);
+        }
+        return Ok(outputs);
+    }
+
+    for entry in fs::read_dir(directory).map_err(|error| {
+        format!(
+            "could not inspect Cargo unit outputs {}: {error}",
+            directory.display()
+        )
+    })? {
+        let entry = entry.map_err(|error| {
+            format!(
+                "could not inspect Cargo unit output in {}: {error}",
+                directory.display()
+            )
+        })?;
+        let path = entry.path();
+        if entry.file_type().is_ok_and(|kind| kind.is_file())
+            && path.extension() != Some(OsStr::new("d"))
+        {
+            outputs.insert(fs::canonicalize(&path).map_err(|error| {
+                format!(
+                    "could not resolve Cargo unit output {}: {error}",
+                    path.display()
+                )
+            })?);
+        }
+    }
+    Ok(outputs)
 }
 
 pub(super) fn build_script_output_observes_environment(
