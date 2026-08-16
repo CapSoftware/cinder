@@ -1216,6 +1216,70 @@ mod tests {
     use super::*;
 
     #[test]
+    fn workspace_member_declarations_reject_escaping_paths() {
+        let workspace = |manifest: &str| {
+            toml::from_str::<toml::Table>(manifest)
+                .unwrap()
+                .get("workspace")
+                .unwrap()
+                .as_table()
+                .unwrap()
+                .clone()
+        };
+        for accepted in [
+            "[workspace]\nmembers = [\"crates/*\", \"tool\"]\n",
+            "[workspace]\nmembers = [\".\", \"extra\"]\ndefault-members = [\".\"]\n",
+            "[workspace]\n",
+        ] {
+            assert!(
+                workspace_member_declarations_stay_in_root(&workspace(accepted)),
+                "{accepted}"
+            );
+        }
+        for rejected in [
+            "[workspace]\nmembers = [\"../shared\"]\n",
+            "[workspace]\nmembers = [\"crates/../../shared\"]\n",
+            "[workspace]\nmembers = [\"/tmp/shared\"]\n",
+            "[workspace]\nmembers = [\"ok\"]\ndefault-members = [\"../shared\"]\n",
+            "[workspace]\nmembers = [\"\"]\n",
+            "[workspace]\nmembers = \"not-an-array\"\n",
+            "[workspace]\nmembers = [7]\n",
+        ] {
+            assert!(
+                !workspace_member_declarations_stay_in_root(&workspace(rejected)),
+                "{rejected}"
+            );
+        }
+    }
+
+    #[test]
+    fn receipt_gap_markers_parse_strictly() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "cinder-receipt-gaps-{unique}-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        assert_eq!(read_receipt_gaps(&root), None);
+        for (contents, expected) in [
+            ("0", Some(0)),
+            ("12", Some(12)),
+            ("012345", Some(12345)),
+            ("", None),
+            ("-1", None),
+            ("1234567", None),
+            ("2 units", None),
+        ] {
+            fs::write(root.join(RECEIPT_GAPS), contents).unwrap();
+            assert_eq!(read_receipt_gaps(&root), expected, "{contents:?}");
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn parses_single_package_selectors_conservatively() {
         let arguments = |values: &[&str]| values.iter().map(OsString::from).collect::<Vec<_>>();
         assert_eq!(
