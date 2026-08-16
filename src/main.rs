@@ -17,7 +17,14 @@ use std::{env, ffi::OsString, path::Path, process::ExitCode};
 fn main() -> ExitCode {
     let mut process_arguments = env::args_os();
     let executable = process_arguments.next().unwrap_or_default();
-    let arguments = process_arguments.collect();
+    let arguments: Vec<OsString> = process_arguments.collect();
+    // The environment-probe wrapper mode engages only when the probe output
+    // variable is set AND the first argument is an absolute rustc path — the
+    // exact shape Cargo uses for RUSTC_WRAPPER invocations during witness
+    // generation. It dumps the invocation and execs the real compiler.
+    if let Some(code) = run::env_probe_wrapper_main(&arguments) {
+        return ExitCode::from(code);
+    }
     let cargo_invocation = invoked_as_cargo(&executable);
     let launch_policy = run::LaunchPolicy::for_invocation(cargo_invocation);
     let result = if cargo_invocation {
