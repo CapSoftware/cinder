@@ -2,9 +2,9 @@
 
 use super::{
     ArtifactFileIdentity, ArtifactReceipt, BTreeSet, BuildScriptOutput, CargoOutputEntry,
-    CargoOutputs, Digest, InputEntry, MetadataExt, OsStr, OsStrExt, OsString, OsStringExt, Path,
-    PathBuf, ProjectTopology, Read, Sha256, TopologyDirectory, UNIX_EPOCH, Write, absolute_path,
-    append_context_value, env, fs, io,
+    CargoOutputs, Digest, InputEntry, MAX_STATE_ROOTS, MetadataExt, OsStr, OsStrExt, OsString,
+    OsStringExt, Path, PathBuf, ProjectTopology, Read, Sha256, SiblingRoot, SourceRecord,
+    TopologyDirectory, UNIX_EPOCH, Write, absolute_path, append_context_value, env, fs, io,
 };
 
 pub(super) fn artifact_metadata(path: &Path) -> Result<(u64, u128), String> {
@@ -1706,51 +1706,56 @@ pub(super) fn read_project_topology(path: &Path) -> Result<ProjectTopology, Stri
     })
 }
 
-pub(super) const SOURCES_MAGIC: &[u8; 8] = b"CNDS0001";
+pub(super) const SOURCES_MAGIC: &[u8; 8] = b"CNDS0002";
+const MAX_SOURCE_ENTRIES: usize = 100_000;
+const MAX_SOURCE_STATE_BYTES: u64 = 256 * 1024 * 1024;
 
-pub(super) fn write_source_paths(path: &Path, sources: &[PathBuf]) -> Result<(), String> {
-    let mut file = fs::File::create(path)
-        .map_err(|error| format!("could not create Cinder source state: {error}"))?;
-    file.write_all(SOURCES_MAGIC)
-        .and_then(|()| file.write_all(&(sources.len() as u64).to_le_bytes()))
-        .map_err(|error| format!("could not write Cinder source state: {error}"))?;
-    for source in sources {
-        let source = source.as_os_str().as_bytes();
-        let length =
-            u32::try_from(source.len()).map_err(|_| "Cinder source path is too long".to_owned())?;
-        file.write_all(&length.to_le_bytes())
-            .and_then(|()| file.write_all(source))
+/// Persists the source path list with each file's recorded filesystem
+/// identity and content digest so a later hit can trust unchanged identities
+/// instead of rehashing the complete revision.
+pub(super) fn write_source_paths(
+    path: &Path,
+    sources: &[PathBuf],
+    records: &[SourceRecord],
+) -> Result<(), String> {
+    if sources.len() != records.len() {
+        return Err("Cinder source records do not describe the source list".to_owned());
+    }
+    if sources.len() > MAX_SOURCE_ENTRIES {
+        return Err("Cinder source state contains too many sources".to_owned());
+    }
+    // Serialized once in memory: thousands of per-entry syscalls on an
+    // unbuffered file dominated publication time for workspace source sets.
+    let mut buffer = Vec::new();
+    buffer.extend_from_slice(SOURCES_MAGIC);
+    buffer.extend_from_slice(&(sources.len() as u64).to_le_bytes());
+    for (source, record) in sources.iter().zip(records) {
+        write_state_bytes(&mut buffer, source.as_os_str().as_bytes(), "source path")?;
+        write_file_identity(&mut buffer, &record.identity, "source state")?;
+        buffer
+            .write_all(&record.digest)
             .map_err(|error| format!("could not write Cinder source state: {error}"))?;
     }
-    Ok(())
+    fs::write(path, buffer).map_err(|error| format!("could not write Cinder source state: {error}"))
 }
 
-pub(super) fn read_source_paths(path: &Path) -> Result<Vec<PathBuf>, String> {
-    let mut file =
-        fs::File::open(path).map_err(|error| format!("could not open source state: {error}"))?;
-    let mut magic = [0u8; 8];
-    let mut count = [0u8; 8];
-    file.read_exact(&mut magic)
-        .and_then(|()| file.read_exact(&mut count))
-        .map_err(|error| format!("could not read Cinder source state: {error}"))?;
+pub(super) fn read_source_paths(path: &Path) -> Result<(Vec<PathBuf>, Vec<SourceRecord>), String> {
+    let contents = read_bounded_state(path, MAX_SOURCE_STATE_BYTES, "Cinder source state")?;
+    let mut reader = StateReader::new(&contents);
+    let magic: [u8; 8] = reader.array("Cinder source state")?;
     if &magic != SOURCES_MAGIC {
         return Err("Cinder source state has an unsupported format".to_owned());
     }
-    let count = usize::try_from(u64::from_le_bytes(count))
+    let count = usize::try_from(u64::from_le_bytes(reader.array("Cinder source state")?))
         .map_err(|_| "Cinder source state is too large".to_owned())?;
+    if count > MAX_SOURCE_ENTRIES {
+        return Err("Cinder source state contains too many sources".to_owned());
+    }
     let mut sources = Vec::with_capacity(count.min(10_000));
+    let mut records = Vec::with_capacity(count.min(10_000));
     for _ in 0..count {
-        let mut length = [0u8; 4];
-        file.read_exact(&mut length)
-            .map_err(|error| format!("could not read Cinder source path: {error}"))?;
-        let length = u32::from_le_bytes(length) as usize;
-        if length > 1_048_576 {
-            return Err("Cinder source path is too long".to_owned());
-        }
-        let mut source = vec![0; length];
-        file.read_exact(&mut source)
-            .map_err(|error| format!("could not read Cinder source path: {error}"))?;
-        let source = PathBuf::from(OsString::from_vec(source));
+        let source = reader.length_prefixed(1_048_576, "source path")?;
+        let source = PathBuf::from(OsString::from_vec(source.to_vec()));
         if source.is_absolute()
             || source
                 .components()
@@ -1758,9 +1763,13 @@ pub(super) fn read_source_paths(path: &Path) -> Result<Vec<PathBuf>, String> {
         {
             return Err("Cinder source path escapes the project directory".to_owned());
         }
+        let identity = read_file_identity(&mut reader, "source identity")?;
+        let digest = reader.array("source digest")?;
         sources.push(source);
+        records.push(SourceRecord { identity, digest });
     }
-    Ok(sources)
+    reader.finish("Cinder source state")?;
+    Ok((sources, records))
 }
 
 pub(super) const CARGO_OUTPUTS_MAGIC: &[u8; 8] = b"CNDO0005";
@@ -1894,6 +1903,91 @@ fn read_cargo_output_path(reader: &mut StateReader<'_>) -> Result<PathBuf, Strin
     path.is_absolute()
         .then_some(path)
         .ok_or_else(|| "Cargo output state contains a relative path".to_owned())
+}
+
+// Distinct from `SOURCES_MAGIC`: the sibling-root and source states are
+// different formats and must never decode interchangeably.
+pub(super) const SIBLING_ROOTS_MAGIC: &[u8; 8] = b"CNDB0001";
+// Three root paths, a fingerprint path, an identity, and a digest per sibling
+// stay far below this even at the full root bound.
+const MAX_SIBLING_ROOT_STATE_BYTES: u64 = 16 * 1024 * 1024;
+
+pub(super) fn write_sibling_roots(path: &Path, roots: &[SiblingRoot]) -> Result<(), String> {
+    if roots.len() >= MAX_STATE_ROOTS {
+        return Err("Cinder state contains too many sibling roots".to_owned());
+    }
+    let mut buffer = Vec::new();
+    buffer.extend_from_slice(SIBLING_ROOTS_MAGIC);
+    buffer.extend_from_slice(&(roots.len() as u64).to_le_bytes());
+    for root in roots {
+        for value in [
+            &root.artifact,
+            &root.dependency_file,
+            &root.hashed_artifact,
+            &root.fingerprint,
+        ] {
+            if !value.is_absolute() {
+                return Err("Cinder sibling-root state requires absolute paths".to_owned());
+            }
+            write_state_bytes(
+                &mut buffer,
+                value.as_os_str().as_bytes(),
+                "sibling root path",
+            )?;
+        }
+        write_file_identity(
+            &mut buffer,
+            &root.artifact_file_identity,
+            "sibling-root state",
+        )?;
+        buffer
+            .write_all(&root.artifact_digest)
+            .map_err(|error| format!("could not write Cinder sibling-root state: {error}"))?;
+    }
+    fs::write(path, buffer)
+        .map_err(|error| format!("could not write Cinder sibling-root state: {error}"))
+}
+
+pub(super) fn read_sibling_roots(path: &Path) -> Result<Vec<SiblingRoot>, String> {
+    let contents = read_bounded_state(path, MAX_SIBLING_ROOT_STATE_BYTES, "sibling-root state")?;
+    let mut reader = StateReader::new(&contents);
+    let magic = reader.array("sibling-root state")?;
+    if &magic != SIBLING_ROOTS_MAGIC {
+        return Err("Cinder sibling-root state has an unsupported format".to_owned());
+    }
+    let count = u64::from_le_bytes(reader.array("sibling root count")?);
+    if count >= MAX_STATE_ROOTS as u64 {
+        return Err("Cinder state contains too many sibling roots".to_owned());
+    }
+    let mut roots = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let read_path = |reader: &mut StateReader<'_>| -> Result<PathBuf, String> {
+            let path = PathBuf::from(OsString::from_vec(
+                reader
+                    .length_prefixed(1_048_576, "sibling root path")?
+                    .to_vec(),
+            ));
+            path.is_absolute()
+                .then_some(path)
+                .ok_or_else(|| "Cinder sibling-root state contains a relative path".to_owned())
+        };
+        let artifact = read_path(&mut reader)?;
+        let dependency_file = read_path(&mut reader)?;
+        let hashed_artifact = read_path(&mut reader)?;
+        let fingerprint = read_path(&mut reader)?;
+        let artifact_file_identity = read_file_identity(&mut reader, "sibling root identity")?;
+        let artifact_digest = reader.array("sibling root digest")?;
+        roots.push(SiblingRoot {
+            artifact,
+            artifact_file_identity,
+            artifact_digest,
+            dependency_file,
+            hashed_artifact,
+            fingerprint,
+        });
+    }
+    reader.finish("Cinder sibling-root state")?;
+    Ok(roots)
 }
 
 pub(super) const RUNTIME_ENVIRONMENT_MAGIC: &[u8; 8] = b"CNDE0001";

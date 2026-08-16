@@ -1,22 +1,24 @@
 //! Validated state publication, loading, promotion, and revision matching.
 
 use super::{
-    BTreeSet, BuildInputGraph, CompilerRecipe, DUPLICATE_EVENT_MAX_AGE, Digest, HistoryProbeCache,
-    Instant, LiteralChange, OsStr, OsStrExt, OsString, OsStringExt, Path, PathBuf, PermissionsExt,
-    Read, Sha256, StateKind, SystemTime, UNIX_EPOCH, Write, append_context_value,
-    artifact_file_identity, artifact_identity, artifact_is_executable, artifact_metadata,
-    bind_observed_shell_environment, build_inputs, build_literal_index, build_source_paths,
-    cargo_outputs_for_artifact, cargo_target_lock_path, clone_file, compiler_unit_graph, env, fs,
-    history_directory, history_recency, input_entries_are_unchanged, input_entries_match_revision,
-    io, make_cached_artifact_read_only, make_private_directory,
-    manifest_has_standard_library_test_harness_at, package_may_have_build_script,
-    parse_state_number, project_may_have_build_script, project_topology_and_inputs,
-    project_topology_is_unchanged, prune_global_history, prune_history, read_cargo_outputs,
-    read_compiler_recipe, read_inputs, read_literal_index, read_project_topology,
-    read_runtime_environment, read_source_paths, runtime_linker_environment, snapshot_sources,
-    source_revision_digest, sources_are_unchanged, state_directory, state_project_directory,
-    touch_history_entry, write_cargo_outputs, write_compiler_recipe, write_inputs,
-    write_literal_index, write_project_topology, write_runtime_environment, write_source_paths,
+    BTreeSet, BuildInputGraph, CompilerRecipe, DUPLICATE_EVENT_MAX_AGE, DiagnosticsReplay, Digest,
+    HistoryProbeCache, Instant, LiteralChange, OsStr, OsStrExt, OsString, OsStringExt, Path,
+    PathBuf, PermissionsExt, Read, Sha256, StateKind, SystemTime, UNIX_EPOCH, Write,
+    append_context_value, artifact_file_identity, artifact_identity, artifact_is_executable,
+    artifact_metadata, bind_observed_shell_environment, build_inputs, build_literal_index,
+    build_source_paths, cargo_outputs_for_artifact, cargo_target_lock_path, clone_file,
+    compiler_unit_graph, env, fs, history_directory, history_recency, input_entries_are_unchanged,
+    input_entries_match_revision, input_identity, io, make_cached_artifact_read_only,
+    make_private_directory, manifest_has_standard_library_test_harness_at,
+    package_may_have_build_script, parse_state_number, project_may_have_build_script,
+    project_topology_and_inputs, project_topology_is_unchanged, prune_global_history,
+    prune_history, read_cargo_outputs, read_compiler_recipe, read_diagnostics, read_inputs,
+    read_literal_index, read_project_topology, read_runtime_environment, read_sibling_roots,
+    read_source_paths, runtime_linker_environment, snapshot_sources, source_revision_digest,
+    sources_are_unchanged, state_directory, state_project_directory, touch_history_entry,
+    write_cargo_outputs, write_compiler_recipe, write_diagnostics, write_inputs,
+    write_literal_index, write_project_topology, write_runtime_environment, write_sibling_roots,
+    write_source_paths,
 };
 
 pub(super) struct State {
@@ -33,11 +35,24 @@ pub(super) struct State {
     pub(super) inputs: Vec<InputEntry>,
     pub(super) project_topology: ProjectTopology,
     pub(super) sources: Vec<PathBuf>,
+    pub(super) source_records: Vec<SourceRecord>,
     pub(super) cargo_outputs: CargoOutputs,
     pub(super) cargo_fingerprints_current: bool,
     pub(super) runtime_environment: Vec<(OsString, OsString)>,
     pub(super) runtime_directory: Option<PathBuf>,
     pub(super) compiler_recipe: Option<CompilerRecipe>,
+    pub(super) diagnostics: DiagnosticsReplay,
+    pub(super) sibling_roots: Vec<SiblingRoot>,
+}
+
+/// The recorded filesystem identity and content digest of one project source
+/// file, index-aligned with the state's source path list. An unchanged
+/// identity proves unchanged content under the same trust model the artifact
+/// receipts use; a changed identity re-reads only that file.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceRecord {
+    pub(super) identity: ArtifactFileIdentity,
+    pub(super) digest: [u8; 32],
 }
 
 pub(super) struct StateLockProbe {
@@ -68,6 +83,29 @@ pub(super) struct CargoOutputEntry {
     pub(super) path: PathBuf,
     pub(super) identity: ArtifactFileIdentity,
 }
+
+/// One additional selected root unit of a multi-target command.
+///
+/// The lexicographically first selected artifact remains the state's primary
+/// artifact; every other selected unit is recorded as a sibling root. Sibling
+/// reachable unit graphs are merged into the primary `CargoOutputs`, so a
+/// sibling carries only its own exact root outputs and artifact identity.
+/// Multi-root states are current-state-only: they are never retained in
+/// revision history and never eligible for patching or direct execution.
+#[derive(Clone, Debug)]
+pub(super) struct SiblingRoot {
+    pub(super) artifact: PathBuf,
+    pub(super) artifact_file_identity: ArtifactFileIdentity,
+    pub(super) artifact_digest: [u8; 32],
+    pub(super) dependency_file: PathBuf,
+    pub(super) hashed_artifact: PathBuf,
+    pub(super) fingerprint: PathBuf,
+}
+
+/// Total selected roots (primary plus siblings) a state may record. Matches
+/// the capture-side selected-artifact bound so a larger command cleanly
+/// disables acceleration instead of truncating.
+pub(super) const MAX_STATE_ROOTS: usize = 256;
 
 pub(super) struct ArtifactReceipt {
     pub(super) artifact: PathBuf,
@@ -311,12 +349,48 @@ pub(super) struct StatePublication<'a> {
     pub(super) inputs: &'a [InputEntry],
     pub(super) project_topology: &'a ProjectTopology,
     pub(super) sources: &'a [PathBuf],
+    pub(super) source_records: &'a [SourceRecord],
     pub(super) cargo_outputs: &'a CargoOutputs,
     pub(super) cargo_fingerprints_current: bool,
     pub(super) runtime_environment: &'a [(OsString, OsString)],
     pub(super) runtime_directory: Option<&'a Path>,
     pub(super) compiler_recipe: Option<&'a CompilerRecipe>,
+    pub(super) diagnostics: &'a DiagnosticsReplay,
+    pub(super) sibling_roots: &'a [SiblingRoot],
     pub(super) duplicate_ready: bool,
+}
+
+/// Captures each live source's identity and content digest with the same
+/// read-then-reverify discipline as `input_identity`, and requires the live
+/// bytes to still equal the verified capture copy. This keeps every recorded
+/// identity paired with exactly the bytes the revision digest describes; a
+/// racing save is an abandoned recording, never a mismatched record. The
+/// complete revision digest is computed from the same capture bytes in this
+/// one pass, bit-identical to `source_revision_digest` over the capture tree.
+fn verified_source_records(
+    directory: &Path,
+    capture: &Path,
+    sources: &[PathBuf],
+) -> Result<(Vec<SourceRecord>, [u8; 32]), String> {
+    let mut records = Vec::with_capacity(sources.len());
+    let mut revision = Sha256::new();
+    revision.update(b"CINDER-SOURCE-REVISION-1");
+    for relative in sources {
+        let (identity, digest) = input_identity(&directory.join(relative))?;
+        let captured = fs::read(capture.join(relative)).map_err(|error| {
+            format!(
+                "could not read source snapshot {}: {error}",
+                relative.display()
+            )
+        })?;
+        if <[u8; 32]>::from(Sha256::digest(&captured)) != digest {
+            return Err("project sources changed while recording build state".to_owned());
+        }
+        append_context_value(&mut revision, relative.as_os_str().as_bytes());
+        append_context_value(&mut revision, &captured);
+        records.push(SourceRecord { identity, digest });
+    }
+    Ok((records, revision.finalize().into()))
 }
 
 fn history_entry_may_match(
@@ -355,7 +429,7 @@ fn history_entry_may_match(
         }
     }
     let sources = match read_source_paths(&entry.join("sources")) {
-        Ok(sources) => sources,
+        Ok((sources, _)) => sources,
         Err(_) => return Ok(false),
     };
     let source_digest = match fs::read(entry.join("source-digest")) {
@@ -536,7 +610,7 @@ impl State {
         if !sources_path.is_file() {
             return Ok(None);
         }
-        let sources = read_source_paths(&sources_path)?;
+        let (sources, source_records) = read_source_paths(&sources_path)?;
         let source_digest = match fs::read(root.join("source-digest")) {
             Ok(value) => <[u8; 32]>::try_from(value)
                 .map_err(|_| "Cinder source digest has an invalid length".to_owned())?,
@@ -618,11 +692,14 @@ impl State {
             inputs,
             project_topology,
             sources,
+            source_records,
             cargo_outputs,
             cargo_fingerprints_current,
             runtime_environment,
             runtime_directory,
             compiler_recipe,
+            diagnostics,
+            sibling_roots,
         }))
     }
 
@@ -862,13 +939,8 @@ impl State {
                 return Err("build inputs changed while recording build state".to_owned());
             }
             let (artifact_file_identity, artifact_digest) = artifact_identity(artifact)?;
-            if !input_entries_are_unchanged(&inputs)
-                || !project_topology_is_unchanged(&project_topology, directory, artifact)?
-                || !sources_are_unchanged(directory, &capture, &sources)?
-            {
-                return Err("build inputs changed while recording build state".to_owned());
-            }
-            let source_digest = source_revision_digest(&capture, &sources)?;
+            let (source_records, source_digest) =
+                verified_source_records(directory, &capture, &sources)?;
             Self::publish(
                 directory,
                 kind,
@@ -886,11 +958,14 @@ impl State {
                     inputs: &inputs,
                     project_topology: &project_topology,
                     sources: &sources,
+                    source_records: &source_records,
                     cargo_outputs: &cargo_outputs,
                     cargo_fingerprints_current: true,
                     runtime_environment: &runtime_environment,
                     runtime_directory: runtime_directory.as_deref(),
                     compiler_recipe: receipt.and_then(|receipt| receipt.compiler_recipe.as_ref()),
+                    diagnostics: &diagnostics,
+                    sibling_roots: &[],
                     duplicate_ready: false,
                 },
             )?;
@@ -938,6 +1013,30 @@ impl State {
                 )
             })?;
             let source_digest = source_revision_digest(&capture, &self.sources)?;
+            // The patched state derives from the proven snapshot plus the
+            // exact accepted edit; unchanged files keep their parent records.
+            // The edited file is re-paired: when the live file still holds
+            // the accepted bytes its live identity is recorded, otherwise the
+            // snapshot copy's identity (which no live path can share) forces
+            // every later hit to re-read the file and correctly miss.
+            if self.source_records.len() != self.sources.len() {
+                return Err("Cinder source records do not describe the source list".to_owned());
+            }
+            let index = self
+                .sources
+                .iter()
+                .position(|source| source == &change.relative)
+                .ok_or_else(|| "patched source is not in the recorded source list".to_owned())?;
+            let patched_digest: [u8; 32] = Sha256::digest(&change.new_source).into();
+            let mut source_records = self.source_records.clone();
+            let live_identity = match input_identity(&directory.join(&change.relative)) {
+                Ok((identity, digest)) if digest == patched_digest => identity,
+                _ => artifact_file_identity(&capture.join(&change.relative))?,
+            };
+            source_records[index] = SourceRecord {
+                identity: live_identity,
+                digest: patched_digest,
+            };
             let artifact_file_identity = artifact_file_identity(artifact)?;
             Self::publish(
                 directory,
@@ -956,11 +1055,17 @@ impl State {
                     inputs: &self.inputs,
                     project_topology: &self.project_topology,
                     sources: &self.sources,
+                    source_records: &source_records,
                     cargo_outputs: &self.cargo_outputs,
                     cargo_fingerprints_current: false,
                     runtime_environment: &self.runtime_environment,
                     runtime_directory: self.runtime_directory.as_deref(),
                     compiler_recipe: self.compiler_recipe.as_ref(),
+                    // A patched state exists only when the parent recorded no
+                    // diagnostics; a patched source was never rendered by
+                    // Cargo, so no recorded replay could be exact for it.
+                    diagnostics: &DiagnosticsReplay::None,
+                    sibling_roots: &[],
                     duplicate_ready,
                 },
             )
@@ -1083,11 +1188,14 @@ impl State {
                     inputs: &state.inputs,
                     project_topology: &state.project_topology,
                     sources: &state.sources,
+                    source_records: &state.source_records,
                     cargo_outputs: &state.cargo_outputs,
                     cargo_fingerprints_current: state.cargo_fingerprints_current,
                     runtime_environment: &state.runtime_environment,
                     runtime_directory: state.runtime_directory.as_deref(),
                     compiler_recipe: state.compiler_recipe.as_ref(),
+                    diagnostics: &state.diagnostics,
+                    sibling_roots: &state.sibling_roots,
                     duplicate_ready: false,
                 },
                 &temporary_artifact,
@@ -1307,11 +1415,14 @@ impl State {
                 inputs: &self.inputs,
                 project_topology: &self.project_topology,
                 sources: &self.sources,
+                source_records: &self.source_records,
                 cargo_outputs: &self.cargo_outputs,
                 cargo_fingerprints_current: false,
                 runtime_environment: &self.runtime_environment,
                 runtime_directory: self.runtime_directory.as_deref(),
                 compiler_recipe: self.compiler_recipe.as_ref(),
+                diagnostics: &self.diagnostics,
+                sibling_roots: &self.sibling_roots,
                 duplicate_ready,
             },
         )
@@ -1330,8 +1441,41 @@ impl State {
         self.run_context == bind_observed_shell_environment(context, self.observes_underscore)
     }
 
+    /// Reports whether the live source set still matches the recorded
+    /// revision. Each recorded source carries its publication-time filesystem
+    /// identity and content digest: an unchanged identity proves unchanged
+    /// content under the same trust model the artifact receipts use, and an
+    /// identity mismatch re-reads only that file, so a touched-but-identical
+    /// file still matches while any content change is a miss.
     pub(super) fn sources_match_revision(&self, directory: &Path) -> Result<bool, String> {
-        Ok(source_revision_digest(directory, &self.sources)? == self.source_digest)
+        if self.source_records.len() != self.sources.len() {
+            return Ok(false);
+        }
+        let mut rehashed = 0usize;
+        for (source, record) in self.sources.iter().zip(&self.source_records) {
+            let path = directory.join(source);
+            if artifact_file_identity(&path).is_ok_and(|identity| identity == record.identity) {
+                continue;
+            }
+            rehashed += 1;
+            if input_identity(&path)?.1 != record.digest {
+                if env::var_os(super::TRACE_RUN).is_some() {
+                    eprintln!(
+                        "    Cinder trace: source revision identities total={} rehashed={rehashed} changed={}",
+                        self.sources.len(),
+                        source.display(),
+                    );
+                }
+                return Ok(false);
+            }
+        }
+        if env::var_os(super::TRACE_RUN).is_some() {
+            eprintln!(
+                "    Cinder trace: source revision identities total={} rehashed={rehashed}",
+                self.sources.len(),
+            );
+        }
+        Ok(true)
     }
 
     pub(super) fn compiler_recipe_supports_direct_check(&self) -> bool {
@@ -1371,11 +1515,10 @@ impl State {
             {
                 return Err("sources changed while recording compiler replay state".to_owned());
             }
-            let source_digest = source_revision_digest(&capture, &sources)?;
             let (artifact_file_identity, artifact_digest) = artifact_identity(&self.artifact)?;
-            if !sources_are_unchanged(directory, &capture, &sources)?
-                || !self.inputs_are_unchanged(directory)?
-            {
+            let (source_records, source_digest) =
+                verified_source_records(directory, &capture, &sources)?;
+            if !self.inputs_are_unchanged(directory)? {
                 return Err("sources changed while recording compiler replay state".to_owned());
             }
             Self::publish(
@@ -1395,11 +1538,17 @@ impl State {
                     inputs: &self.inputs,
                     project_topology: &self.project_topology,
                     sources: &sources,
+                    source_records: &source_records,
                     cargo_outputs: &self.cargo_outputs,
                     cargo_fingerprints_current: false,
                     runtime_environment: &self.runtime_environment,
                     runtime_directory: self.runtime_directory.as_deref(),
                     compiler_recipe: self.compiler_recipe.as_ref(),
+                    // The experimental replay is gated on a state with no
+                    // recorded diagnostics, and an accepted replay produced no
+                    // compiler output.
+                    diagnostics: &DiagnosticsReplay::None,
+                    sibling_roots: &[],
                     duplicate_ready: false,
                 },
             )
@@ -1535,11 +1684,14 @@ pub(super) fn write_state_directory(
         inputs,
         project_topology,
         sources,
+        source_records,
         cargo_outputs,
         cargo_fingerprints_current,
         runtime_environment,
         runtime_directory,
         compiler_recipe,
+        diagnostics,
+        sibling_roots,
         duplicate_ready,
         ..
     } = publication;
@@ -1595,7 +1747,7 @@ pub(super) fn write_state_directory(
     .map_err(|error| format!("could not record observed compiler environment: {error}"))?;
     write_inputs(&destination.join("inputs"), inputs)?;
     write_project_topology(&destination.join("project-topology"), project_topology)?;
-    write_source_paths(&destination.join("sources"), sources)?;
+    write_source_paths(&destination.join("sources"), sources, source_records)?;
     write_cargo_outputs(&destination.join("cargo-outputs"), cargo_outputs)?;
     fs::write(
         destination.join("cargo-fingerprints-current"),
@@ -1622,6 +1774,8 @@ pub(super) fn write_state_directory(
     if let Some(compiler_recipe) = compiler_recipe {
         write_compiler_recipe(&destination.join("compiler-recipe"), compiler_recipe)?;
     }
+    write_diagnostics(&destination.join("diagnostics"), diagnostics)?;
+    write_sibling_roots(&destination.join("sibling-roots"), sibling_roots)?;
     if duplicate_ready {
         let ready_ns = SystemTime::now()
             .duration_since(UNIX_EPOCH)
