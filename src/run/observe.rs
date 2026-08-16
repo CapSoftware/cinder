@@ -85,6 +85,11 @@ mod macos {
     struct ObservedInvocation {
         executable: PathBuf,
         arguments: Vec<OsString>,
+        /// The process environment parsed from the KERN_PROCARGS2 tail, or
+        /// `None` when the tail was absent or malformed. The parse is
+        /// trusted only after the environment-witness probe has proven it
+        /// byte-exact against wrapper-recorded environments on this machine.
+        environment: Option<Vec<(OsString, OsString)>>,
     }
 
     #[repr(C)]
@@ -213,6 +218,7 @@ mod macos {
             invocation.executable,
             working_directory,
             invocation.arguments,
+            invocation.environment,
         )
     }
 
@@ -313,10 +319,65 @@ mod macos {
             return None;
         }
         arguments.remove(0);
+        let environment = parse_process_environment(bytes, offset);
         Some(ObservedInvocation {
             executable,
             arguments,
+            environment,
         })
+    }
+
+    /// Apple auxiliary-vector names that follow the environment block in
+    /// KERN_PROCARGS2. Depending on how the process was spawned they arrive
+    /// with or without an empty-string separator, so they terminate the
+    /// environment parse by name. A genuine environment variable shadowing
+    /// one of these names truncates the parse; the witness's parser proof
+    /// then fails and replay stays off — never a wrong environment.
+    const APPLE_AUXILIARY_NAMES: [&[u8]; 12] = [
+        b"arm64e_abi",
+        b"dyld_file",
+        b"executable_boothash",
+        b"executable_cdhash",
+        b"executable_file",
+        b"executable_path",
+        b"main_stack",
+        b"malloc_entropy",
+        b"pfz",
+        b"ptr_munge",
+        b"stack_guard",
+        b"th_port",
+    ];
+
+    /// Parses the environment strings that follow argv in KERN_PROCARGS2.
+    ///
+    /// The environment block is the run of `NAME=value` strings ending at
+    /// the first empty string or the first Apple auxiliary entry. A tail
+    /// that ends before any terminator, or an entry without `=` or with an
+    /// empty name, is not an environment Cinder will reason about.
+    fn parse_process_environment(
+        bytes: &[u8],
+        mut offset: usize,
+    ) -> Option<Vec<(OsString, OsString)>> {
+        let mut environment = Vec::new();
+        loop {
+            let end = next_zero(bytes, offset)?;
+            let entry = &bytes[offset..end];
+            if entry.is_empty() {
+                return Some(environment);
+            }
+            let separator = entry.iter().position(|byte| *byte == b'=')?;
+            if separator == 0 {
+                return None;
+            }
+            if APPLE_AUXILIARY_NAMES.contains(&&entry[..separator]) {
+                return Some(environment);
+            }
+            environment.push((
+                OsString::from_vec(entry[..separator].to_vec()),
+                OsString::from_vec(entry[separator + 1..].to_vec()),
+            ));
+            offset = end.checked_add(1)?;
+        }
     }
 
     fn next_zero(bytes: &[u8], offset: usize) -> Option<usize> {
@@ -370,6 +431,64 @@ mod macos {
             );
             assert!(recipe.environment.is_empty());
             fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        fn parses_environment_tails_with_and_without_apple_separators() {
+            let build = |tail: &[&[u8]]| {
+                let arguments = ["rustc", "--crate-name", "observed"];
+                let mut bytes = Vec::new();
+                bytes.extend_from_slice(&(arguments.len() as c_int).to_ne_bytes());
+                bytes.extend_from_slice(b"/toolchain/bin/rustc\0\0");
+                for argument in arguments {
+                    bytes.extend_from_slice(argument.as_bytes());
+                    bytes.push(0);
+                }
+                for entry in tail {
+                    bytes.extend_from_slice(entry);
+                    bytes.push(0);
+                }
+                bytes
+            };
+
+            // Empty-string separator before the Apple strings.
+            let invocation = parse_process_arguments(&build(&[
+                b"CARGO_PKG_NAME=app",
+                b"MULTI=line\nvalue",
+                b"",
+                b"main_stack=",
+            ]))
+            .unwrap();
+            assert_eq!(
+                invocation.environment,
+                Some(vec![
+                    (OsString::from("CARGO_PKG_NAME"), OsString::from("app")),
+                    (OsString::from("MULTI"), OsString::from("line\nvalue")),
+                ])
+            );
+
+            // No separator: the first Apple auxiliary name terminates.
+            let invocation = parse_process_arguments(&build(&[
+                b"CARGO_PKG_NAME=app",
+                b"executable_cdhash=abc",
+                b"arm64e_abi=all",
+            ]))
+            .unwrap();
+            assert_eq!(
+                invocation.environment,
+                Some(vec![(
+                    OsString::from("CARGO_PKG_NAME"),
+                    OsString::from("app")
+                )])
+            );
+
+            // A tail that ends without any terminator is not an environment.
+            let invocation = parse_process_arguments(&build(&[b"CARGO_PKG_NAME=app"])).unwrap();
+            assert_eq!(invocation.environment, None);
+
+            // An entry without `=` is not an environment either.
+            let invocation = parse_process_arguments(&build(&[b"JUNKENTRY", b""])).unwrap();
+            assert_eq!(invocation.environment, None);
         }
 
         #[test]
