@@ -36,6 +36,23 @@ pub struct PackageSelection {
     package_id: Option<String>,
     manifest_path: Option<PathBuf>,
     cache_path: Option<PathBuf>,
+    workspace_root: Option<PathBuf>,
+}
+
+/// How the invocation-directory manifest selects packages for capture.
+enum ManifestSelection {
+    /// One exact package directory; artifacts match its canonical manifest.
+    Package(PathBuf),
+    /// A workspace root `check`; every member unit under the root is a
+    /// selected root.
+    Workspace(PathBuf),
+    /// A manifest shape whose selected package set Cinder cannot prove, such
+    /// as explicit `default-members` outside a workspace-mode `check`.
+    /// Capture stays disabled so reuse can never under-validate the command.
+    Blocked,
+    /// Not a package or workspace manifest Cinder recognizes; the exact
+    /// package-ID probe may still resolve an explicit selection.
+    NoSelection,
 }
 
 pub fn selected_package(
@@ -44,15 +61,31 @@ pub fn selected_package(
     context: &[u8],
 ) -> Option<PackageSelection> {
     if package_selector(arguments)?.is_none() {
-        if let Some(manifest_path) = selected_package_manifest(arguments) {
-            if env::var_os(super::TRACE_RUN).is_some() {
-                eprintln!("    Cinder trace: Cargo package ID=message-manifest");
+        match selected_manifest_mode(arguments) {
+            ManifestSelection::Package(manifest_path) => {
+                if env::var_os(super::TRACE_RUN).is_some() {
+                    eprintln!("    Cinder trace: Cargo package ID=message-manifest");
+                }
+                return Some(PackageSelection {
+                    package_id: None,
+                    manifest_path: Some(manifest_path),
+                    cache_path: None,
+                    workspace_root: None,
+                });
             }
-            return Some(PackageSelection {
-                package_id: None,
-                manifest_path: Some(manifest_path),
-                cache_path: None,
-            });
+            ManifestSelection::Workspace(workspace_root) => {
+                if env::var_os(super::TRACE_RUN).is_some() {
+                    eprintln!("    Cinder trace: Cargo package ID=workspace-members");
+                }
+                return Some(PackageSelection {
+                    package_id: None,
+                    manifest_path: None,
+                    cache_path: None,
+                    workspace_root: Some(workspace_root),
+                });
+            }
+            ManifestSelection::Blocked => return None,
+            ManifestSelection::NoSelection => {}
         }
     }
     let (cache_path, workspace) = package_cache_path(arguments)?;
@@ -64,6 +97,7 @@ pub fn selected_package(
             package_id: Some(package_id),
             manifest_path: None,
             cache_path: Some(cache_path),
+            workspace_root: None,
         });
     }
     let package_id = resolve_package_id(cargo, arguments)?;
@@ -75,10 +109,17 @@ pub fn selected_package(
         package_id: Some(package_id),
         manifest_path: None,
         cache_path: Some(cache_path),
+        workspace_root: None,
     })
 }
 
-fn selected_package_manifest(arguments: &[OsString]) -> Option<PathBuf> {
+fn selected_manifest_mode(arguments: &[OsString]) -> ManifestSelection {
+    selected_manifest_path(arguments).map_or(ManifestSelection::NoSelection, |manifest| {
+        classify_selected_manifest(arguments, &manifest)
+    })
+}
+
+fn selected_manifest_path(arguments: &[OsString]) -> Option<PathBuf> {
     let command_index = super::capture::cargo_subcommand_index(arguments)?;
     let command_directory = super::cargo::cargo_change_directory(arguments)
         .ok()?
@@ -118,10 +159,97 @@ fn selected_package_manifest(arguments: &[OsString]) -> Option<PathBuf> {
     if !metadata.is_file() || metadata.len() > MAX_PACKAGE_MANIFEST_BYTES {
         return None;
     }
-    let contents = fs::read_to_string(&manifest).ok()?;
-    let manifest_value = toml::from_str::<toml::Table>(&contents).ok()?;
-    manifest_value.get("package")?.as_table()?;
-    fs::canonicalize(manifest).ok()
+    Some(manifest)
+}
+
+/// Decides how the invocation manifest selects packages.
+///
+/// A plain package manifest keeps the existing exact-package mode. A manifest
+/// with a `[workspace]` table can build members beyond one package's
+/// dependency closure, so a workspace-root `check` captures every member unit
+/// instead, and every other command shape with explicit `default-members`
+/// stays entirely Cargo-owned: single-package capture there would record only
+/// part of what Cargo built and a later reuse could return stale results for
+/// the other members.
+fn classify_selected_manifest(arguments: &[OsString], manifest: &Path) -> ManifestSelection {
+    let Ok(contents) = fs::read_to_string(manifest) else {
+        return ManifestSelection::NoSelection;
+    };
+    let Ok(manifest_value) = toml::from_str::<toml::Table>(&contents) else {
+        return ManifestSelection::NoSelection;
+    };
+    let has_package = manifest_value
+        .get("package")
+        .is_some_and(toml::Value::is_table);
+    let workspace = match manifest_value.get("workspace") {
+        None => {
+            return if has_package {
+                fs::canonicalize(manifest)
+                    .ok()
+                    .map_or(ManifestSelection::NoSelection, ManifestSelection::Package)
+            } else {
+                ManifestSelection::NoSelection
+            };
+        }
+        Some(toml::Value::Table(workspace)) => workspace,
+        Some(_) => return ManifestSelection::Blocked,
+    };
+    let has_default_members = workspace.contains_key("default-members");
+    if has_package && !has_default_members {
+        // Without explicit default-members, a root-package workspace command
+        // selects only the root package; exact-package capture stays sound.
+        return fs::canonicalize(manifest)
+            .ok()
+            .map_or(ManifestSelection::NoSelection, ManifestSelection::Package);
+    }
+    if matches!(super::cargo_subcommand(arguments), Some("check" | "c"))
+        && super::cargo::primary_target_selector_count(arguments) == 0
+    {
+        // A member declared outside the root directory would produce units the
+        // canonical-root artifact matcher cannot select, so its edits could
+        // never invalidate the recorded state. Only provably in-root member
+        // declarations may enter workspace capture.
+        if !workspace_member_declarations_stay_in_root(workspace) {
+            return ManifestSelection::Blocked;
+        }
+        return fs::canonicalize(manifest)
+            .ok()
+            .and_then(|manifest| manifest.parent().map(Path::to_owned))
+            .map_or(ManifestSelection::NoSelection, ManifestSelection::Workspace);
+    }
+    if has_package && has_default_members {
+        return ManifestSelection::Blocked;
+    }
+    ManifestSelection::NoSelection
+}
+
+/// Accepts only `members`/`default-members` entries that are relative paths or
+/// globs without any parent-directory component. Anything else — an absolute
+/// path, a `..` component, or a malformed array — could name a member outside
+/// the workspace root.
+fn workspace_member_declarations_stay_in_root(workspace: &toml::Table) -> bool {
+    for key in ["members", "default-members"] {
+        let Some(value) = workspace.get(key) else {
+            continue;
+        };
+        let Some(entries) = value.as_array() else {
+            return false;
+        };
+        for entry in entries {
+            let Some(entry) = entry.as_str() else {
+                return false;
+            };
+            if entry.is_empty()
+                || Path::new(entry).is_absolute()
+                || Path::new(entry)
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir))
+            {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn resolve_package_id(cargo: &Path, arguments: &[OsString]) -> Option<String> {
@@ -428,6 +556,7 @@ struct MessageCapture<'a> {
     receipt_directory: &'a Path,
     selected_package_id: Option<String>,
     selected_manifest_path: Option<&'a Path>,
+    workspace_root: Option<&'a Path>,
     package_cache_path: Option<&'a Path>,
     artifacts: Vec<serde_json::Value>,
     build_scripts: Vec<(String, PathBuf)>,
@@ -449,6 +578,7 @@ impl<'a> MessageCapture<'a> {
             receipt_directory,
             selected_package_id: selection.package_id.clone(),
             selected_manifest_path: selection.manifest_path.as_deref(),
+            workspace_root: selection.workspace_root.as_deref(),
             package_cache_path: selection.cache_path.as_deref(),
             artifacts: Vec::new(),
             build_scripts: Vec::new(),
@@ -547,6 +677,21 @@ impl<'a> MessageCapture<'a> {
         let Some(package_id) = value.get("package_id").and_then(serde_json::Value::as_str) else {
             return false;
         };
+        // Workspace mode selects every member unit under the canonical root;
+        // dependency units outside the root remain graph-validated inputs.
+        if let Some(root) = self.workspace_root {
+            let Some(manifest) = value
+                .get("manifest_path")
+                .and_then(serde_json::Value::as_str)
+                .map(Path::new)
+            else {
+                return false;
+            };
+            return manifest.starts_with(root)
+                || fs::canonicalize(manifest)
+                    .ok()
+                    .is_some_and(|resolved| resolved.starts_with(root));
+        }
         if let Some(selected) = self.selected_package_id.as_deref() {
             return selected == package_id;
         }
@@ -1025,7 +1170,10 @@ mod tests {
                 .and_then(toml::Value::as_table)
                 .is_some()
         );
-        assert_eq!(selected_package_manifest(&arguments), Some(manifest));
+        assert!(matches!(
+            selected_manifest_mode(&arguments),
+            ManifestSelection::Package(selected) if selected == manifest
+        ));
     }
 
     #[test]
@@ -1081,6 +1229,7 @@ mod tests {
             package_id: Some("package-id".to_owned()),
             manifest_path: None,
             cache_path: Some(cache.clone()),
+            workspace_root: None,
         };
         MessageCapture::new(&receipts, &selection, false).finish();
         assert!(!cache.exists());
@@ -1094,6 +1243,7 @@ mod tests {
             package_id: Some("selected".to_owned()),
             manifest_path: None,
             cache_path: None,
+            workspace_root: None,
         };
         let artifact = |kind: serde_json::Value| {
             serde_json::to_vec(&serde_json::json!({
@@ -1132,6 +1282,7 @@ mod tests {
             package_id: Some("selected".to_owned()),
             manifest_path: None,
             cache_path: None,
+            workspace_root: None,
         };
         let message = |package_id: serde_json::Value, out_directory: serde_json::Value| {
             serde_json::to_vec(&serde_json::json!({
@@ -1203,6 +1354,7 @@ mod tests {
             package_id: Some("app 0.1.0 (path+file:///app)".to_owned()),
             manifest_path: None,
             cache_path: None,
+            workspace_root: None,
         };
         let mut capture = MessageCapture::new(&receipts, &selection, false);
         capture.artifacts = vec![valid, invalid];
