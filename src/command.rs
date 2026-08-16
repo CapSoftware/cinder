@@ -7,9 +7,40 @@ use std::{
     time::Instant,
 };
 
+/// A tuned Cargo child that died to a signal is reported through this
+/// sentinel so the stock fallback can rerun the command; it never reaches
+/// the user.
+const TUNED_SIGNAL_SENTINEL: &str = "cinder-tuned compiler terminated by signal";
+
 pub fn run_cargo(
     arguments: Vec<OsString>,
     launch_policy: crate::run::LaunchPolicy,
+) -> Result<u8, String> {
+    let routing = crate::toolchain::apply_routing(&arguments);
+    if matches!(routing, crate::toolchain::Routing::Stock) {
+        return run_cargo_inner(arguments, launch_policy, routing);
+    }
+    let original_arguments = arguments.clone();
+    match run_cargo_inner(arguments, launch_policy, routing) {
+        Ok(code) => Ok(code),
+        Err(error) if error == TUNED_SIGNAL_SENTINEL => crate::toolchain::fallback_to_stock(
+            &original_arguments,
+            crate::toolchain::TunedFailure::Signal,
+        ),
+        Err(error) if error.starts_with("could not execute") => {
+            crate::toolchain::fallback_to_stock(
+                &original_arguments,
+                crate::toolchain::TunedFailure::Launch,
+            )
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn run_cargo_inner(
+    arguments: Vec<OsString>,
+    launch_policy: crate::run::LaunchPolicy,
+    routing: crate::toolchain::Routing,
 ) -> Result<u8, String> {
     let cargo = cargo_executable()?;
     reject_recursive_delegate(&cargo)?;
@@ -118,6 +149,12 @@ pub fn run_cargo(
         command.args(arguments);
         crate::usage::remove_control_environment(&mut command);
         let status = execute_captured_cargo(&mut command, receipt_directory, &capture_mode)?;
+        if matches!(routing, crate::toolchain::Routing::Tuned)
+            && crate::toolchain::died_to_signal(status)
+        {
+            let _ = std::fs::remove_dir_all(receipt_directory);
+            return Err(TUNED_SIGNAL_SENTINEL.to_owned());
+        }
         if status.success() {
             if captures_build {
                 crate::run::schedule_completed_build(
@@ -174,11 +211,32 @@ pub fn run_cargo(
         crate::usage::remove_control_environment(&mut command);
         if let Some(receipt_directory) = receipt_directory.as_deref() {
             let status = execute_captured_cargo(&mut command, receipt_directory, &capture_mode)?;
+            if matches!(routing, crate::toolchain::Routing::Tuned)
+                && crate::toolchain::died_to_signal(status)
+            {
+                let _ = std::fs::remove_dir_all(receipt_directory);
+                if let Some(context_path) = context_path {
+                    let _ = std::fs::remove_file(context_path);
+                }
+                return Err(TUNED_SIGNAL_SENTINEL.to_owned());
+            }
             if !status.success() {
                 let _ = std::fs::remove_dir_all(receipt_directory);
                 if let Some(context_path) = context_path {
                     let _ = std::fs::remove_file(context_path);
                 }
+            }
+            return Ok(exit_code(status));
+        }
+        if matches!(routing, crate::toolchain::Routing::Tuned) {
+            // Keep the parent alive under tuned routing so a crashed tuned
+            // compiler can still fall back to the stock toolchain; the stock
+            // path keeps Cargo's exact exec semantics.
+            let status = command
+                .status()
+                .map_err(|error| format!("could not execute {}: {error}", cargo.display()))?;
+            if crate::toolchain::died_to_signal(status) {
+                return Err(TUNED_SIGNAL_SENTINEL.to_owned());
             }
             return Ok(exit_code(status));
         }
