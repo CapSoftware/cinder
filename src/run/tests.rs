@@ -19,11 +19,16 @@ use super::{
         cargo_fingerprint_value, cargo_fingerprint_value_index, environment_affects_context,
         parse_encoded_dependency_environment,
     },
+    diagnostics::{
+        DiagnosticsReplay, hidden_pass_arguments, read_diagnostics, replay_region, strip_ansi,
+        write_diagnostics,
+    },
     inputs::{
         PROJECT_TOPOLOGY_MAGIC, add_build_script_inputs, artifact_file_identity, input_identity,
         primary_dependency_file, project_topology, project_topology_is_unchanged,
-        read_cargo_outputs, read_inputs, read_project_topology, write_cargo_outputs, write_inputs,
-        write_project_topology,
+        read_cargo_outputs, read_inputs, read_project_topology, read_sibling_roots,
+        read_source_paths, write_cargo_outputs, write_inputs, write_project_topology,
+        write_sibling_roots, write_source_paths,
     },
     patch::{
         CodeSignatureContract, PatchMode, changed_format_segment, code_signature_contract,
@@ -33,8 +38,8 @@ use super::{
     source::{LiteralChange, changed_plain_literal, source_literal_candidates},
     state::{
         ArtifactFileIdentity, ArtifactReceipt, BuildScriptOutput, CargoOutputEntry, CargoOutputs,
-        InputEntry, LiteralIndexEntry, ProjectTopology, State, StatePublication,
-        read_artifact_receipt, write_artifact_receipt, write_state_directory,
+        InputEntry, LiteralIndexEntry, ProjectTopology, SiblingRoot, SourceRecord, State,
+        StatePublication, read_artifact_receipt, write_artifact_receipt, write_state_directory,
     },
 };
 use std::{
@@ -119,6 +124,230 @@ fn artifact_receipt_round_trips_the_complete_build_script_graph_and_rejects_trai
         .err()
         .expect("receipt with trailing data must be rejected");
     assert!(error.contains("trailing data"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn sibling_root_state_round_trips_and_rejects_trailing_or_relative_data() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "cinder-sibling-roots-{unique}-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let path = root.join("sibling-roots");
+    let sibling = SiblingRoot {
+        artifact: root.join("target/debug/tool"),
+        artifact_file_identity: ArtifactFileIdentity {
+            size: 16,
+            modified_ns: 42,
+            device: 1,
+            inode: 2,
+            changed_seconds: 3,
+            changed_nanoseconds: 4,
+        },
+        artifact_digest: [7; 32],
+        dependency_file: root.join("target/debug/deps/tool-abc.d"),
+        hashed_artifact: root.join("target/debug/deps/tool-abc"),
+        fingerprint: root.join("target/debug/.fingerprint/tool-abc"),
+    };
+
+    write_sibling_roots(&path, std::slice::from_ref(&sibling)).unwrap();
+    let read = read_sibling_roots(&path).unwrap();
+    assert_eq!(read.len(), 1);
+    assert_eq!(read[0].artifact, sibling.artifact);
+    assert_eq!(
+        read[0].artifact_file_identity,
+        sibling.artifact_file_identity
+    );
+    assert_eq!(read[0].artifact_digest, sibling.artifact_digest);
+    assert_eq!(read[0].dependency_file, sibling.dependency_file);
+    assert_eq!(read[0].hashed_artifact, sibling.hashed_artifact);
+    assert_eq!(read[0].fingerprint, sibling.fingerprint);
+
+    write_sibling_roots(&path, &[]).unwrap();
+    assert!(read_sibling_roots(&path).unwrap().is_empty());
+
+    let mut relative = sibling.clone();
+    relative.dependency_file = PathBuf::from("deps/tool-abc.d");
+    assert!(
+        write_sibling_roots(&path, std::slice::from_ref(&relative))
+            .unwrap_err()
+            .contains("absolute")
+    );
+
+    write_sibling_roots(&path, std::slice::from_ref(&sibling)).unwrap();
+    use std::io::Write as _;
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"unexpected")
+        .unwrap();
+    assert!(
+        read_sibling_roots(&path)
+            .unwrap_err()
+            .contains("trailing data")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn source_state_round_trips_records_and_rejects_trailing_or_mismatched_data() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("cinder-sources-{unique}-{}", std::process::id()));
+    fs::create_dir_all(&root).unwrap();
+    let path = root.join("sources");
+    let sources = vec![PathBuf::from("src/lib.rs"), PathBuf::from("src/main.rs")];
+    let records = vec![
+        SourceRecord {
+            identity: ArtifactFileIdentity {
+                size: 16,
+                modified_ns: 42,
+                device: 1,
+                inode: 2,
+                changed_seconds: 3,
+                changed_nanoseconds: 4,
+            },
+            digest: [7; 32],
+        },
+        SourceRecord {
+            identity: ArtifactFileIdentity {
+                size: 61,
+                modified_ns: 43,
+                device: 1,
+                inode: 5,
+                changed_seconds: 6,
+                changed_nanoseconds: 7,
+            },
+            digest: [8; 32],
+        },
+    ];
+
+    write_source_paths(&path, &sources, &records).unwrap();
+    let (read_sources, read_records) = read_source_paths(&path).unwrap();
+    assert_eq!(read_sources, sources);
+    assert_eq!(read_records, records);
+
+    assert!(
+        write_source_paths(&path, &sources, &records[..1])
+            .unwrap_err()
+            .contains("do not describe")
+    );
+
+    write_source_paths(&path, &sources, &records).unwrap();
+    use std::io::Write as _;
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"unexpected")
+        .unwrap();
+    assert!(
+        read_source_paths(&path)
+            .unwrap_err()
+            .contains("trailing data")
+    );
+
+    // The previous format has a different magic and is an ordinary miss.
+    let mut stale = b"CNDS0001".to_vec();
+    stale.extend_from_slice(&0_u64.to_le_bytes());
+    fs::write(&path, stale).unwrap();
+    assert!(
+        read_source_paths(&path)
+            .unwrap_err()
+            .contains("unsupported format")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+fn minimal_state_for(root: &Path) -> State {
+    State {
+        snapshot: root.join("snapshot"),
+        source_digest: [0; 32],
+        artifact: root.join("artifact"),
+        public_artifact: root.join("artifact"),
+        program_name: OsString::from("artifact"),
+        artifact_file_identity: ArtifactFileIdentity {
+            size: 0,
+            modified_ns: 0,
+            device: 0,
+            inode: 0,
+            changed_seconds: 0,
+            changed_nanoseconds: 0,
+        },
+        artifact_digest: None,
+        literal_index: Vec::new(),
+        run_context: Vec::new(),
+        observes_underscore: false,
+        inputs: Vec::new(),
+        project_topology: ProjectTopology {
+            digest: [0; 32],
+            directories: Vec::new(),
+        },
+        sources: Vec::new(),
+        source_records: Vec::new(),
+        cargo_outputs: CargoOutputs {
+            dependency_file: PathBuf::new(),
+            artifact: PathBuf::new(),
+            fingerprint: PathBuf::new(),
+            unit_fingerprints: Vec::new(),
+            unit_dependency_files: Vec::new(),
+            unit_artifacts: Vec::new(),
+            unit_fingerprint_files: Vec::new(),
+        },
+        cargo_fingerprints_current: false,
+        runtime_environment: Vec::new(),
+        runtime_directory: None,
+        compiler_recipe: None,
+        diagnostics: DiagnosticsReplay::None,
+        sibling_roots: Vec::new(),
+    }
+}
+
+#[test]
+fn source_revision_identities_trust_unchanged_files_and_reject_changed_content() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "cinder-source-revision-{unique}-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(root.join("src")).unwrap();
+    let live = root.join("src/lib.rs");
+    fs::write(&live, b"pub fn touched() -> u32 { 7 }\n").unwrap();
+    let (identity, digest) = input_identity(&live).unwrap();
+    let mut state = minimal_state_for(&root);
+    state.sources = vec![PathBuf::from("src/lib.rs")];
+    state.source_records = vec![SourceRecord { identity, digest }];
+
+    // Unchanged identity is trusted without reading the file.
+    assert!(state.sources_match_revision(&root).unwrap());
+
+    // A touched file with identical bytes still matches the revision.
+    let restored = fs::read(&live).unwrap();
+    fs::write(&live, &restored).unwrap();
+    assert!(state.sources_match_revision(&root).unwrap());
+
+    // A same-length content change misses even with a restored timestamp.
+    let earlier = fs::metadata(&live).unwrap().modified().unwrap();
+    fs::write(&live, b"pub fn touched() -> u32 { 9 }\n").unwrap();
+    let file = fs::OpenOptions::new().write(true).open(&live).unwrap();
+    file.set_modified(earlier).unwrap();
+    drop(file);
+    assert!(!state.sources_match_revision(&root).unwrap());
+
+    // A record list that does not describe the sources is a miss.
+    state.source_records.clear();
+    assert!(!state.sources_match_revision(&root).unwrap());
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -508,11 +737,17 @@ fn global_revision_budget_includes_restored_run_artifacts() {
             inputs: &[],
             project_topology: &topology,
             sources: &sources,
+            source_records: &[SourceRecord {
+                identity,
+                digest: [9_u8; 32],
+            }],
             cargo_outputs: &cargo_outputs,
             cargo_fingerprints_current: true,
             runtime_environment: &[],
             runtime_directory: None,
             compiler_recipe: None,
+            diagnostics: &DiagnosticsReplay::None,
+            sibling_roots: &[],
             duplicate_ready: false,
         },
         &cached,
@@ -807,6 +1042,7 @@ fn patching_preserves_ad_hoc_entitlements_and_hardened_runtime() {
             directories: Vec::new(),
         },
         sources: Vec::new(),
+        source_records: Vec::new(),
         cargo_outputs: CargoOutputs {
             dependency_file: PathBuf::new(),
             artifact: PathBuf::new(),
@@ -820,6 +1056,8 @@ fn patching_preserves_ad_hoc_entitlements_and_hardened_runtime() {
         runtime_environment: Vec::new(),
         runtime_directory: None,
         compiler_recipe: None,
+        diagnostics: DiagnosticsReplay::None,
+        sibling_roots: Vec::new(),
     };
     let change = LiteralChange {
         relative: PathBuf::from("src/main.rs"),
@@ -1164,6 +1402,28 @@ fn accepts_equal_length_format_and_ordinary_string_changes() {
 }
 
 #[test]
+fn rejects_literal_data_rustc_refuses_to_compile() {
+    // U+202E (right-to-left override) is three UTF-8 bytes, the same length as
+    // the three ASCII bytes it replaces, but rustc denies it in literals.
+    let old = "fn label() { show(\"Camera abc Preview\"); }".as_bytes();
+    let new = "fn label() { show(\"Camera \u{202E} Preview\"); }".as_bytes();
+    assert_eq!(old.len(), new.len());
+    assert!(changed_plain_literal(old, new).is_none());
+
+    // U+2066 (left-to-right isolate) inside a format-literal suffix.
+    let old = "fn value() { format!(\"{} cinder-abc-one\", value); }".as_bytes();
+    let new = "fn value() { format!(\"{} cinder-\u{2066}-one\", value); }".as_bytes();
+    assert_eq!(old.len(), new.len());
+    assert!(changed_plain_literal(old, new).is_none());
+
+    // A bare carriage return in a string literal is a hard rustc error.
+    let old = b"fn label() { show(\"Camera a Preview\"); }";
+    let new = b"fn label() { show(\"Camera \r Preview\"); }";
+    assert_eq!(old.len(), new.len());
+    assert!(changed_plain_literal(old, new).is_none());
+}
+
+#[test]
 fn extracts_one_changed_format_segment() {
     assert_eq!(
         changed_format_segment(
@@ -1207,4 +1467,162 @@ fn ignores_non_runtime_or_non_verbatim_string_syntax() {
         source_literal_candidates(source),
         vec![b"Runtime Label".to_vec()]
     );
+}
+
+#[test]
+fn replay_region_extracts_diagnostics_before_the_finished_line() {
+    let stderr = b"warning: unused variable: `unused`\n --> src/lib.rs:2:9\n\nwarning: `probe` (lib) generated 1 warning\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.01s\n";
+    let region = replay_region(stderr).unwrap();
+    assert_eq!(
+        region,
+        b"warning: unused variable: `unused`\n --> src/lib.rs:2:9\n\nwarning: `probe` (lib) generated 1 warning\n"
+    );
+
+    let quiet = b"    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.00s\n";
+    assert_eq!(replay_region(quiet).unwrap(), b"");
+}
+
+#[test]
+fn replay_region_rejects_non_quiet_passes() {
+    let compiling = b"   Compiling probe v0.1.0 (/tmp/probe)\n    Finished `dev` profile in 0.4s\n";
+    assert!(replay_region(compiling).is_err());
+    assert!(replay_region(b"warning: something\n").is_err());
+    let twice = b"    Finished `dev` profile in 0.1s\n    Finished `dev` profile in 0.1s\n";
+    assert!(replay_region(twice).is_err());
+    let trailing = b"    Finished `dev` profile in 0.1s\nerror: unexpected\n";
+    assert!(replay_region(trailing).is_err());
+}
+
+#[test]
+fn replay_region_strips_transient_lock_wait_lines() {
+    // A concurrent Cargo briefly holding a shared lock only delays the pass;
+    // an uncontended no-change command prints the same bytes without the
+    // `Blocking` status lines, so they are removed rather than failing
+    // recording on a busy machine.
+    let blocking = b"    Blocking waiting for file lock on package cache\nwarning: unused\n    Blocking waiting for file lock on build directory\n    Finished `dev` profile in 0.1s\n";
+    assert_eq!(replay_region(blocking).unwrap(), b"warning: unused\n");
+    let only_blocking =
+        b"    Blocking waiting for file lock on package cache\n    Finished `dev` profile in 0.1s\n";
+    assert_eq!(replay_region(only_blocking).unwrap(), b"");
+}
+
+#[test]
+fn replay_region_accepts_test_executable_lines_and_ansi_status() {
+    let no_run = b"warning: unused\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s\n  Executable unittests src/lib.rs (target/debug/deps/probe-1234)\n";
+    assert_eq!(replay_region(no_run).unwrap(), b"warning: unused\n");
+
+    let ansi = b"\x1b[1m\x1b[33mwarning\x1b[0m: unused\n\x1b[1m\x1b[32m    Finished\x1b[0m `dev` profile in 0.01s\n";
+    assert_eq!(
+        replay_region(ansi).unwrap(),
+        b"\x1b[1m\x1b[33mwarning\x1b[0m: unused\n"
+    );
+}
+
+#[test]
+fn strip_ansi_removes_escape_sequences_for_classification_only() {
+    assert_eq!(
+        strip_ansi(b"\x1b[1m\x1b[32m    Finished\x1b[0m `dev` profile"),
+        b"    Finished `dev` profile"
+    );
+    assert_eq!(strip_ansi(b"plain text"), b"plain text");
+}
+
+#[test]
+fn hidden_pass_arguments_derive_no_change_command_shapes() {
+    let arguments =
+        |values: &[&str]| -> Vec<OsString> { values.iter().map(OsString::from).collect() };
+    let artifact = Path::new("/tmp/target/debug/app-name");
+
+    let check =
+        hidden_pass_arguments(&arguments(&["check", "--lib"]), StateKind::Check, artifact).unwrap();
+    assert_eq!(check, arguments(&["check", "--lib"]));
+
+    let test = hidden_pass_arguments(
+        &arguments(&["test", "--lib", "--", "--nocapture"]),
+        StateKind::Test,
+        artifact,
+    )
+    .unwrap();
+    assert_eq!(test, arguments(&["test", "--lib", "--no-run"]));
+
+    let no_run = hidden_pass_arguments(
+        &arguments(&["test", "--no-run", "--lib"]),
+        StateKind::Test,
+        artifact,
+    )
+    .unwrap();
+    assert_eq!(no_run, arguments(&["test", "--no-run", "--lib"]));
+
+    let run = hidden_pass_arguments(
+        &arguments(&["run", "-p", "pkg", "--", "value"]),
+        StateKind::Run,
+        artifact,
+    )
+    .unwrap();
+    assert_eq!(run, arguments(&["build", "-p", "pkg", "--bin", "app-name"]));
+
+    let example = hidden_pass_arguments(
+        &arguments(&["run", "--example", "demo"]),
+        StateKind::Run,
+        artifact,
+    )
+    .unwrap();
+    assert_eq!(example, arguments(&["build", "--example", "demo"]));
+}
+
+#[test]
+fn diagnostic_replay_state_round_trips_and_rejects_malformed_records() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "cinder-diagnostics-state-{}-{unique}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let path = root.join("diagnostics");
+
+    for diagnostics in [
+        DiagnosticsReplay::None,
+        DiagnosticsReplay::Pinned(b"warning: pinned\n".to_vec()),
+        DiagnosticsReplay::Both {
+            plain: b"warning: plain\n".to_vec(),
+            ansi: b"\x1b[33mwarning\x1b[0m: ansi\n".to_vec(),
+        },
+    ] {
+        write_diagnostics(&path, &diagnostics).unwrap();
+        assert_eq!(read_diagnostics(&path).unwrap(), diagnostics);
+    }
+
+    let valid = fs::read(&path).unwrap();
+    let mut trailing = valid.clone();
+    trailing.push(0);
+    fs::write(&path, &trailing).unwrap();
+    assert!(read_diagnostics(&path).is_err());
+
+    fs::write(&path, b"BADMAGIC").unwrap();
+    assert!(read_diagnostics(&path).is_err());
+
+    let mut truncated = valid;
+    truncated.truncate(10);
+    fs::write(&path, &truncated).unwrap();
+    assert!(read_diagnostics(&path).is_err());
+
+    assert!(write_diagnostics(&path, &DiagnosticsReplay::Pinned(Vec::new())).is_err());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn diagnostic_replay_variant_follows_the_stderr_terminal() {
+    let both = DiagnosticsReplay::Both {
+        plain: b"plain\n".to_vec(),
+        ansi: b"ansi\n".to_vec(),
+    };
+    assert_eq!(both.replay_bytes(true).unwrap(), b"ansi\n");
+    assert_eq!(both.replay_bytes(false).unwrap(), b"plain\n");
+    let pinned = DiagnosticsReplay::Pinned(b"pinned\n".to_vec());
+    assert_eq!(pinned.replay_bytes(true).unwrap(), b"pinned\n");
+    assert_eq!(pinned.replay_bytes(false).unwrap(), b"pinned\n");
+    assert!(DiagnosticsReplay::None.replay_bytes(true).is_none());
 }

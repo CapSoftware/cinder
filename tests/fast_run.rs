@@ -193,7 +193,8 @@ fn patches_a_binary_build_and_keeps_cargo_freshness_correct() {
     assert_success(&unchanged);
     assert!(
         stderr(&unchanged).contains("Cinder reused"),
-        "expected no-change build reuse, got:\n{}",
+        "expected no-change build reuse:\ninitial:\n{}\nunchanged:\n{}",
+        stderr(&initial),
         stderr(&unchanged)
     );
 
@@ -268,16 +269,20 @@ fn restores_a_previous_structural_build_without_invoking_cargo() {
 fn cargo_build_alias_restores_a_previous_revision() {
     let fixture = Fixture::new();
     fixture.write_structural_source(2);
-    assert_success(&fixture.build_alias());
+    let first = fixture.build_alias();
+    assert_success(&first);
     fixture.write_structural_source(3);
-    assert_success(&fixture.build_alias());
+    let second = fixture.build_alias();
+    assert_success(&second);
     fixture.write_structural_source(2);
 
     let restored = fixture.build_alias();
     assert_success(&restored);
     assert!(
         stderr(&restored).contains("Cinder restored a validated previous build"),
-        "cargo b did not use build history:\n{}",
+        "cargo b did not use build history:\nfirst:\n{}\nsecond:\n{}\nrestored:\n{}",
+        stderr(&first),
+        stderr(&second),
         stderr(&restored)
     );
     assert_eq!(fixture.built_stdout(), "15");
@@ -1624,16 +1629,51 @@ fn reuses_an_unchanged_named_integration_check() {
 }
 
 #[test]
-fn multi_unit_check_stays_on_cargo() {
+fn multi_unit_check_reuses_and_invalidates_per_target() {
     let fixture = Fixture::new();
     fixture.write_library_source("one");
     assert_success(&fixture.check_default());
-    assert!(!fixture.state_directory().join("check").exists());
+    assert!(fixture.state_directory().join("check").exists());
 
-    let fresh = fixture.check_default();
-    assert_success(&fresh);
-    assert!(!stderr(&fresh).contains("Cinder reused"));
-    assert!(!fixture.state_directory().join("check").exists());
+    let reused = fixture.check_default();
+    assert_success(&reused);
+    assert!(
+        stderr(&reused).contains("Cinder reused the validated check of 2 targets"),
+        "multi-target no-change check did not reuse:\n{}",
+        stderr(&reused)
+    );
+
+    // Editing only the binary source must invalidate the whole recorded set.
+    fs::write(
+        &fixture.source,
+        "fn main() { println!(\"{} bin-two\", env!(\"CINDER_FIXTURE_VALUE\")); }\n",
+    )
+    .unwrap();
+    let changed = fixture.check_default();
+    assert_success(&changed);
+    assert!(!stderr(&changed).contains("Cinder reused"));
+    let reconverged = fixture.check_default();
+    assert_success(&reconverged);
+    assert!(
+        stderr(&reconverged).contains("Cinder reused the validated check of 2 targets"),
+        "edited multi-target check did not reconverge:\n{}",
+        stderr(&reconverged)
+    );
+
+    // Editing only the library source must invalidate as well.
+    fs::write(
+        fixture.root.join("src/lib.rs"),
+        "pub fn value() -> &'static str { \"library-two\" }\n",
+    )
+    .unwrap();
+    let library_changed = fixture.check_default();
+    assert_success(&library_changed);
+    assert!(!stderr(&library_changed).contains("Cinder reused"));
+    let library_reconverged = fixture.check_default();
+    assert_success(&library_reconverged);
+    assert!(
+        stderr(&library_reconverged).contains("Cinder reused the validated check of 2 targets")
+    );
 }
 
 #[test]
@@ -2860,7 +2900,7 @@ fn patches_strings_linked_from_the_packages_library_target() {
 }
 
 #[test]
-fn unselected_multi_artifact_builds_stay_on_cargo() {
+fn unselected_multi_artifact_source_changes_stay_on_cargo() {
     let fixture = Fixture::new();
     fixture.write_library_source("one");
     assert_success(&fixture.build());
@@ -3251,6 +3291,12 @@ fn external_path_dependency_sources_invalidate_selected_check_reuse() {
     );
     assert!(stderr(&missing_fingerprint_marker).contains("Checking external-dependency"));
 
+    // Repairing the marker takes Cargo more than one pass to settle: the pass
+    // after the rebuild still re-checks the dependency. The diagnostic-replay
+    // recorder proves that with a hidden no-change pass and abandons the
+    // not-yet-quiet state, so reuse resumes only once Cargo converges.
+    let converging = fixture.check_selected_lib();
+    assert_success(&converging);
     let repaired_fingerprint = fixture.check_selected_lib();
     assert_success(&repaired_fingerprint);
     assert!(stderr(&repaired_fingerprint).contains("Cinder reused the validated check"));
@@ -3494,6 +3540,850 @@ fn cargo_run_forwards_json_shaped_program_output_after_build_completion() {
         stdout(&output),
         "{\"reason\":\"compiler-artifact\",\"program\":true}\ntail"
     );
+}
+
+#[test]
+fn touched_but_identical_sources_still_reuse_the_validated_check() {
+    let fixture = Fixture::new();
+    fs::write(&fixture.source, "fn main() {}\n").unwrap();
+
+    assert_success(&fixture.check_selected_bin());
+    let reused = fixture.check_selected_bin();
+    assert_success(&reused);
+    assert!(stderr(&reused).contains("Cinder reused the validated check"));
+
+    // An editor save that rewrites identical bytes changes the file identity
+    // but not the revision; the hit re-reads only that file and still reuses.
+    let contents = fs::read(&fixture.source).unwrap();
+    fs::write(&fixture.source, &contents).unwrap();
+    let touched = fixture.check_selected_bin();
+    assert_success(&touched);
+    assert!(
+        stderr(&touched).contains("Cinder reused the validated check"),
+        "a touched-but-identical source must still reuse:\n{}",
+        stderr(&touched)
+    );
+}
+
+#[test]
+fn same_length_source_changes_outside_literals_invalidate_check_reuse() {
+    let fixture = Fixture::new();
+    fs::write(&fixture.source, "fn main() { let value = 5; }\n").unwrap();
+
+    assert_success(&fixture.check_selected_bin());
+    assert!(stderr(&fixture.check_selected_bin()).contains("Cinder reused the validated check"));
+
+    // Same byte length, different content, outside any string literal.
+    fs::write(&fixture.source, "fn main() { let value = 7; }\n").unwrap();
+    let changed = fixture.check_selected_bin();
+    assert_success(&changed);
+    assert!(
+        !stderr(&changed).contains("Cinder reused the validated check"),
+        "a changed source must not reuse:\n{}",
+        stderr(&changed)
+    );
+    assert!(stderr(&changed).contains("Checking"));
+}
+
+#[test]
+fn check_reuse_replays_recorded_cargo_warnings() {
+    let fixture = Fixture::new();
+    fs::write(&fixture.source, "fn main() { let unused = 5; }\n").unwrap();
+
+    let initial = fixture.check_selected_bin();
+    assert_success(&initial);
+    assert!(stderr(&initial).contains("unused variable: `unused`"));
+
+    let reused = fixture.check_selected_bin();
+    assert_success(&reused);
+    let errors = stderr(&reused);
+    assert!(
+        errors.contains("Cinder reused the validated check"),
+        "no-change check with a warning did not reuse:\n{errors}"
+    );
+    assert!(
+        errors.contains("unused variable: `unused`") && errors.contains("generated 1 warning"),
+        "reuse hit did not replay Cargo's cached warning:\n{errors}"
+    );
+    assert!(
+        errors.find("unused variable").unwrap() < errors.find("Cinder reused").unwrap(),
+        "warning replay must precede the Cinder marker:\n{errors}"
+    );
+
+    fs::write(&fixture.source, "fn main() { let _used = 5; }\n").unwrap();
+    let fixed = fixture.check_selected_bin();
+    assert_success(&fixed);
+    let clean = fixture.check_selected_bin();
+    assert_success(&clean);
+    let errors = stderr(&clean);
+    assert!(errors.contains("Cinder reused the validated check"));
+    assert!(
+        !errors.contains("warning"),
+        "a fixed warning must not be replayed:\n{errors}"
+    );
+}
+
+#[test]
+fn asynchronously_recorded_check_state_replays_warnings() {
+    let fixture = Fixture::new();
+    fs::write(&fixture.source, "fn main() { let unused = 5; }\n").unwrap();
+
+    let initial = fixture.check_selected_targets_with_recording(
+        "check",
+        &["--bin", "cinder-fast-run-fixture"],
+        None,
+        false,
+    );
+    assert_success(&initial);
+    fixture.wait_for_state("check");
+
+    let reused = fixture.check_selected_bin();
+    assert_success(&reused);
+    let errors = stderr(&reused);
+    assert!(
+        errors.contains("Cinder reused the validated check")
+            && errors.contains("unused variable: `unused`")
+            && errors.contains("generated 1 warning"),
+        "asynchronously recorded state did not replay Cargo's warning:\n{errors}"
+    );
+}
+
+#[test]
+fn build_reuse_replays_recorded_cargo_warnings() {
+    let fixture = Fixture::new();
+    fs::write(
+        &fixture.source,
+        "fn main() { let unused = 5; println!(\"built\"); }\n",
+    )
+    .unwrap();
+
+    let initial = fixture.build();
+    assert_success(&initial);
+    let reused = fixture.build();
+    assert_success(&reused);
+    let errors = stderr(&reused);
+    assert!(
+        errors.contains("Cinder reused")
+            && errors.contains("unused variable: `unused`")
+            && errors.contains("generated 1 warning"),
+        "no-change build did not replay Cargo's cached warning:\ninitial:\n{}\nreused:\n{errors}",
+        stderr(&initial)
+    );
+}
+
+#[test]
+fn direct_test_execution_replays_recorded_cargo_warnings() {
+    let fixture = Fixture::new();
+    fs::write(&fixture.source, "fn main() {}\n").unwrap();
+    fs::write(
+        fixture.root.join("src/lib.rs"),
+        "pub fn touched() -> u32 { let unused = 5; 7 }\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn touches_the_library() { assert_eq!(crate::touched(), 7); }\n}\n",
+    )
+    .unwrap();
+
+    let initial = fixture.test_selected_lib();
+    assert_success(&initial);
+    assert!(stderr(&initial).contains("unused variable: `unused`"));
+
+    let reused = fixture.test_selected_lib();
+    assert_success(&reused);
+    let errors = stderr(&reused);
+    assert!(
+        errors.contains("Cinder running the validated test executable"),
+        "no-change test with a warning did not run directly:\n{errors}"
+    );
+    assert!(
+        errors.contains("unused variable: `unused`"),
+        "direct test execution did not replay Cargo's cached warning:\n{errors}"
+    );
+    assert!(
+        errors.find("unused variable").unwrap()
+            < errors
+                .find("Cinder running the validated test executable")
+                .unwrap(),
+        "warning replay must precede the Cinder marker:\n{errors}"
+    );
+    assert!(stdout(&reused).contains("running 1 test"));
+    assert!(stdout(&reused).contains("test result: ok. 1 passed"));
+}
+
+#[test]
+fn recorded_warnings_keep_string_patches_on_cargo() {
+    let fixture = Fixture::new();
+    let warned_source = |value: &str| {
+        format!(
+            "fn main() {{ let unused = 5; println!(\"{{}} {{}}\", env!(\"CINDER_FIXTURE_VALUE\"), \"ordinary-{value}\"); }}\n"
+        )
+    };
+    fs::write(&fixture.source, warned_source("one")).unwrap();
+
+    let initial = fixture.run("alpha");
+    assert_success(&initial);
+    assert_eq!(stdout(&initial), "alpha ordinary-one");
+
+    fs::write(&fixture.source, warned_source("two")).unwrap();
+    let fallback = fixture.run("alpha");
+    assert_success(&fallback);
+    assert_eq!(stdout(&fallback), "alpha ordinary-two");
+    assert!(
+        !stderr(&fallback).contains("Cinder patched"),
+        "a state with recorded warnings must not be patched:\n{}",
+        stderr(&fallback)
+    );
+}
+
+#[test]
+fn run_reuse_replays_recorded_cargo_warnings() {
+    let fixture = Fixture::new();
+    fs::write(
+        &fixture.source,
+        "fn main() { let unused = 5; println!(\"{}\", env!(\"CINDER_FIXTURE_VALUE\")); }\n",
+    )
+    .unwrap();
+
+    let initial = fixture.run("direct");
+    assert_success(&initial);
+    let restored = fixture.run("direct");
+    assert_success(&restored);
+    let errors = stderr(&restored);
+    assert!(
+        errors.contains("Cinder restored") && errors.contains("unused variable: `unused`"),
+        "restored run did not replay Cargo's cached warning:\n{errors}"
+    );
+
+    let reused = fixture.run("direct");
+    assert_success(&reused);
+    let errors = stderr(&reused);
+    assert!(
+        errors.contains("Cinder reusing") && errors.contains("unused variable: `unused`"),
+        "direct no-change run did not replay Cargo's cached warning:\n{errors}"
+    );
+}
+
+#[test]
+fn pinned_color_replays_exact_ansi_warning_bytes() {
+    let fixture = Fixture::new();
+    fs::write(&fixture.source, "fn main() { let unused = 5; }\n").unwrap();
+    let check = |fixture: &Fixture| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cinder"));
+        command
+            .current_dir(&fixture.root)
+            .args(["check", "--bin", "cinder-fast-run-fixture"]);
+        command
+            .env("CINDER_REAL_CARGO", "cargo")
+            .env("CINDER_FIXTURE_VALUE", "check")
+            .env("CINDER_SYNCHRONOUS_STATE_RECORDING", "1")
+            .env("CARGO_TERM_COLOR", "always")
+            .env("CARGO_TARGET_DIR", fixture.root.join("target"))
+            .env_remove("CINDER_DISABLE_FAST_CHECK")
+            .output()
+            .unwrap()
+    };
+
+    assert_success(&check(&fixture));
+    let reused = check(&fixture);
+    assert_success(&reused);
+    let errors = stderr(&reused);
+    assert!(
+        errors.contains("Cinder reused the validated check"),
+        "pinned-color check did not reuse:\n{errors}"
+    );
+    assert!(
+        errors.contains('\u{1b}') && errors.contains("unused variable"),
+        "pinned always color must replay Cargo's ANSI warning bytes:\n{errors}"
+    );
+}
+
+#[test]
+fn multi_target_build_reuses_and_refuses_string_patch() {
+    let fixture = Fixture::new();
+    fs::write(
+        &fixture.source,
+        "fn main() { println!(\"{} {}\", env!(\"CINDER_FIXTURE_VALUE\"), \"ordinary-one\"); }\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.root.join("src/lib.rs"),
+        "pub fn value() -> &'static str { \"library-one\" }\n",
+    )
+    .unwrap();
+
+    assert_success(&fixture.build());
+    assert!(fixture.state_directory().join("build").exists());
+    let reused = fixture.build();
+    assert_success(&reused);
+    assert!(
+        stderr(&reused).contains("Cinder reused the validated build of 2 targets"),
+        "multi-target no-change build did not reuse:\n{}",
+        stderr(&reused)
+    );
+
+    // An equal-length literal edit is patchable for a single executable, but a
+    // multi-root state must stay on Cargo.
+    fs::write(
+        &fixture.source,
+        "fn main() { println!(\"{} {}\", env!(\"CINDER_FIXTURE_VALUE\"), \"ordinary-two\"); }\n",
+    )
+    .unwrap();
+    let rebuilt = fixture.build();
+    assert_success(&rebuilt);
+    assert!(
+        !stderr(&rebuilt).contains("Cinder patched"),
+        "a multi-root build state must not be patched:\n{}",
+        stderr(&rebuilt)
+    );
+    assert!(stderr(&rebuilt).contains("Compiling cinder-fast-run-fixture"));
+    let reconverged = fixture.build();
+    assert_success(&reconverged);
+    assert!(stderr(&reconverged).contains("Cinder reused the validated build of 2 targets"));
+}
+
+fn workspace_member(root: &Path, name: &str, build_script: bool, library: &str) {
+    let member = root.join(name);
+    fs::create_dir_all(member.join("src")).unwrap();
+    let mut manifest =
+        format!("[package]\nname = \"{name}\"\nversion = \"0.0.0\"\nedition = \"2024\"\n");
+    if build_script {
+        manifest.push_str("build = \"build.rs\"\n");
+        fs::write(member.join("build.rs"), "fn main() {}\n").unwrap();
+    }
+    fs::write(member.join("Cargo.toml"), manifest).unwrap();
+    fs::write(member.join("src/lib.rs"), library).unwrap();
+}
+
+#[test]
+fn workspace_root_check_reuses_every_member() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "cinder-workspace-root-check-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"alpha\", \"beta\"]\nresolver = \"3\"\n",
+    )
+    .unwrap();
+    workspace_member(&root, "alpha", true, "pub fn alpha() -> u32 { 1 }\n");
+    workspace_member(
+        &root,
+        "beta",
+        false,
+        "pub fn beta() -> u32 { let unused = 5; 2 }\n",
+    );
+    let fixture = Fixture {
+        source: root.join("beta/src/lib.rs"),
+        root,
+        package: None,
+    };
+
+    let initial = fixture.check_default();
+    assert_success(&initial);
+    // A build-script package reports `Compiling`, not `Checking`.
+    assert!(stderr(&initial).contains("alpha v0.0.0"));
+    assert!(stderr(&initial).contains("Checking beta"));
+    assert!(fixture.state_directory().join("check").exists());
+
+    let reused = fixture.check_default();
+    assert_success(&reused);
+    let errors = stderr(&reused);
+    assert!(
+        errors.contains("Cinder reused the validated check of 2 targets"),
+        "workspace-root no-change check did not reuse:\n{errors}"
+    );
+    assert!(
+        errors.contains("unused variable: `unused`"),
+        "workspace hit did not replay the member warning:\n{errors}"
+    );
+
+    // Editing one member invalidates the whole recorded set.
+    fs::write(
+        &fixture.source,
+        "pub fn beta() -> u32 { let unused = 5; 3 }\n",
+    )
+    .unwrap();
+    let changed = fixture.check_default();
+    assert_success(&changed);
+    assert!(!stderr(&changed).contains("Cinder reused"));
+    assert!(stderr(&changed).contains("Checking beta"));
+    let reconverged = fixture.check_default();
+    assert_success(&reconverged);
+    assert!(stderr(&reconverged).contains("Cinder reused the validated check of 2 targets"));
+
+    // A new member changes the selected set through project topology.
+    workspace_member(
+        &fixture.root,
+        "gamma",
+        false,
+        "pub fn gamma() -> u32 { 4 }\n",
+    );
+    fs::write(
+        fixture.root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"alpha\", \"beta\", \"gamma\"]\nresolver = \"3\"\n",
+    )
+    .unwrap();
+    let extended = fixture.check_default();
+    assert_success(&extended);
+    assert!(!stderr(&extended).contains("Cinder reused"));
+    assert!(stderr(&extended).contains("Checking gamma"));
+    let extended_reuse = fixture.check_default();
+    assert_success(&extended_reuse);
+    assert!(
+        stderr(&extended_reuse).contains("Cinder reused the validated check of 3 targets"),
+        "extended workspace did not reconverge:\n{}",
+        stderr(&extended_reuse)
+    );
+}
+
+#[test]
+fn out_of_root_workspace_members_disable_capture() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let outer = std::env::temp_dir().join(format!(
+        "cinder-out-of-root-member-{}-{nonce}",
+        std::process::id()
+    ));
+    let root = outer.join("ws");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"alpha\", \"../shared\"]\nresolver = \"3\"\n",
+    )
+    .unwrap();
+    workspace_member(&root, "alpha", false, "pub fn alpha() -> u32 { 1 }\n");
+    workspace_member(&outer, "shared", false, "pub fn shared() -> u32 { 2 }\n");
+    let fixture = Fixture {
+        source: outer.join("shared/src/lib.rs"),
+        root,
+        package: None,
+    };
+
+    // Current Cargo rejects members that are not hierarchically below the
+    // root; the error must pass through unchanged and no state may exist.
+    // The classifier additionally blocks capture for any Cargo that would
+    // accept the declaration.
+    let initial = fixture.check_default();
+    assert!(!initial.status.success());
+    assert!(stderr(&initial).contains("not hierarchically below"));
+    assert!(
+        !fixture.state_directory().join("check").exists(),
+        "an out-of-root member declaration must never record workspace state"
+    );
+}
+
+#[test]
+fn symlinked_workspace_members_disable_capture() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let outer = std::env::temp_dir().join(format!(
+        "cinder-symlink-member-{}-{nonce}",
+        std::process::id()
+    ));
+    let root = outer.join("ws");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"alpha\", \"linked\"]\nresolver = \"3\"\n",
+    )
+    .unwrap();
+    workspace_member(&root, "alpha", false, "pub fn alpha() -> u32 { 1 }\n");
+    workspace_member(&outer, "escaped", false, "pub fn escaped() -> u32 { 2 }\n");
+    std::os::unix::fs::symlink(outer.join("escaped"), root.join("linked")).unwrap();
+    let fixture = Fixture {
+        source: outer.join("escaped/src/lib.rs"),
+        root,
+        package: None,
+    };
+
+    // Whether Cargo accepts or rejects the symlinked member, Cinder must
+    // never record a workspace state whose member set it cannot prove
+    // in-root: the escaped member's canonical sources would be invisible to
+    // later validation.
+    let initial = fixture.check_default();
+    assert!(
+        !fixture.state_directory().join("check").exists(),
+        "a symlinked out-of-root member must never record workspace state:\n{}",
+        stderr(&initial)
+    );
+    if initial.status.success() {
+        let repeat = fixture.check_default();
+        assert_success(&repeat);
+        assert!(!stderr(&repeat).contains("Cinder reused"));
+    }
+}
+
+#[test]
+fn procedural_macro_members_are_validated_workspace_check_roots() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "cinder-proc-macro-member-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"normal\", \"macros\"]\nresolver = \"3\"\n",
+    )
+    .unwrap();
+    workspace_member(&root, "normal", false, "pub fn normal() -> u32 { 1 }\n");
+    let macros = root.join("macros");
+    fs::create_dir_all(macros.join("src")).unwrap();
+    fs::write(
+        macros.join("Cargo.toml"),
+        "[package]\nname = \"macros\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[lib]\nproc-macro = true\n",
+    )
+    .unwrap();
+    fs::write(
+        macros.join("src/lib.rs"),
+        "use proc_macro::TokenStream;\n#[proc_macro]\npub fn noop(input: TokenStream) -> TokenStream { input }\n",
+    )
+    .unwrap();
+    let fixture = Fixture {
+        source: macros.join("src/lib.rs"),
+        root,
+        package: None,
+    };
+
+    let initial = fixture.check_default();
+    assert_success(&initial);
+    assert!(stderr(&initial).contains("macros"));
+
+    let reused = fixture.check_default();
+    assert_success(&reused);
+    assert!(
+        stderr(&reused).contains("Cinder reused the validated check of 2 targets"),
+        "a proc-macro member must be an ordinary validated check root:\n{}",
+        stderr(&reused)
+    );
+
+    // The proc-macro member's edits must invalidate and reach Cargo.
+    fs::write(
+        &fixture.source,
+        "use proc_macro::TokenStream;\n#[proc_macro]\npub fn noop(input: TokenStream) -> TokenStream { let unused = 5; input }\n",
+    )
+    .unwrap();
+    let edited = fixture.check_default();
+    assert_success(&edited);
+    assert!(!stderr(&edited).contains("Cinder reused"));
+    assert!(stderr(&edited).contains("unused variable: `unused`"));
+
+    // The warning replays on the re-recorded hit, and the state converges.
+    let replayed = fixture.check_default();
+    assert_success(&replayed);
+    assert!(stderr(&replayed).contains("Cinder reused the validated check of 2 targets"));
+    assert!(stderr(&replayed).contains("unused variable: `unused`"));
+
+    // The experimental compiler replay must still refuse recipe publication
+    // for a graph containing a proc-macro target, independent of receipts.
+    fs::write(
+        &fixture.source,
+        "use proc_macro::TokenStream;\n#[proc_macro]\npub fn noop(input: TokenStream) -> TokenStream { let _used = 5; input }\n",
+    )
+    .unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cinder"));
+    command.current_dir(&fixture.root).arg("check");
+    command
+        .env("CINDER_REAL_CARGO", "cargo")
+        .env("CINDER_SYNCHRONOUS_STATE_RECORDING", "1")
+        .env("CINDER_EXPERIMENTAL_DIRECT_CHECK", "1")
+        .env("CINDER_TRACE_RUN", "1")
+        .env("CARGO_TARGET_DIR", fixture.root.join("target"))
+        .env_remove("CINDER_DISABLE_FAST_CHECK");
+    let experimental = command.output().unwrap();
+    assert_success(&experimental);
+    assert!(
+        stderr(&experimental)
+            .contains("compiler replay disabled by unsupported Cargo target graph"),
+        "a proc-macro member must keep recipe publication disabled:\n{}",
+        stderr(&experimental)
+    );
+    assert!(!stderr(&experimental).contains("Cinder replayed"));
+}
+
+#[test]
+fn multi_crate_type_members_still_disable_workspace_capture() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "cinder-multi-crate-type-member-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"normal\", \"mixed\"]\nresolver = \"3\"\n",
+    )
+    .unwrap();
+    workspace_member(&root, "normal", false, "pub fn normal() -> u32 { 1 }\n");
+    let mixed = root.join("mixed");
+    fs::create_dir_all(mixed.join("src")).unwrap();
+    fs::write(
+        mixed.join("Cargo.toml"),
+        "[package]\nname = \"mixed\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[lib]\ncrate-type = [\"staticlib\", \"rlib\"]\n",
+    )
+    .unwrap();
+    fs::write(mixed.join("src/lib.rs"), "pub fn mixed() -> u32 { 2 }\n").unwrap();
+    let fixture = Fixture {
+        source: mixed.join("src/lib.rs"),
+        root,
+        package: None,
+    };
+
+    let initial = fixture.check_default();
+    assert_success(&initial);
+    assert!(
+        !fixture.state_directory().join("check").exists(),
+        "a multi-crate-type member without a receipt must disable multi-root recording"
+    );
+
+    let repeat = fixture.check_default();
+    assert_success(&repeat);
+    assert!(!stderr(&repeat).contains("Cinder reused"));
+}
+
+#[test]
+fn an_old_state_format_is_a_quiet_cargo_miss() {
+    let fixture = Fixture::new();
+    fs::write(&fixture.source, "fn main() {}\n").unwrap();
+
+    assert_success(&fixture.check_selected_bin());
+    let reused = fixture.check_selected_bin();
+    assert_success(&reused);
+    assert!(stderr(&reused).contains("Cinder reused the validated check"));
+
+    // A sources file from a previous Cinder version has an older magic.
+    let sources = fixture.state_directory().join("check/sources");
+    assert!(sources.is_file());
+    fs::write(&sources, b"CNDS0001stale-format-payload").unwrap();
+
+    let miss = fixture.check_selected_bin();
+    assert_success(&miss);
+    let errors = stderr(&miss);
+    assert!(
+        !errors.contains("unavailable") && !errors.contains("unsupported format"),
+        "an old state format must not surface a user-visible error:\n{errors}"
+    );
+    assert!(!errors.contains("Cinder reused"));
+    assert!(errors.contains("Finished"));
+}
+
+#[test]
+fn color_override_environments_keep_warning_states_on_cargo() {
+    let fixture = Fixture::new();
+    fs::write(&fixture.source, "fn main() { let unused = 5; }\n").unwrap();
+    let check = |fixture: &Fixture| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cinder"));
+        command
+            .current_dir(&fixture.root)
+            .args(["check", "--bin", "cinder-fast-run-fixture"]);
+        command
+            .env("CINDER_REAL_CARGO", "cargo")
+            .env("CINDER_FIXTURE_VALUE", "check")
+            .env("CINDER_SYNCHRONOUS_STATE_RECORDING", "1")
+            .env("NO_COLOR", "1")
+            .env("CARGO_TARGET_DIR", fixture.root.join("target"))
+            .env_remove("CINDER_DISABLE_FAST_CHECK")
+            .output()
+            .unwrap()
+    };
+
+    let initial = check(&fixture);
+    assert_success(&initial);
+    assert!(stderr(&initial).contains("unused variable: `unused`"));
+
+    // The replay cannot be proven under NO_COLOR, so reuse stays on Cargo and
+    // Cargo itself keeps replaying the warning.
+    let repeat = check(&fixture);
+    assert_success(&repeat);
+    assert!(!stderr(&repeat).contains("Cinder reused"));
+    assert!(stderr(&repeat).contains("unused variable: `unused`"));
+}
+
+#[test]
+fn workspace_roots_with_target_selectors_stay_on_exact_package_rules() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "cinder-workspace-selector-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"rootpkg\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[workspace]\nmembers = [\".\", \"extra\"]\ndefault-members = [\".\", \"extra\"]\nresolver = \"3\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn root() -> u32 { 1 }\n").unwrap();
+    workspace_member(&root, "extra", false, "pub fn extra() -> u32 { 2 }\n");
+    let fixture = Fixture {
+        source: root.join("src/lib.rs"),
+        root,
+        package: None,
+    };
+    let check_lib = |fixture: &Fixture| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cinder"));
+        command.current_dir(&fixture.root).args(["check", "--lib"]);
+        command
+            .env("CINDER_REAL_CARGO", "cargo")
+            .env("CINDER_FIXTURE_VALUE", "check")
+            .env("CINDER_SYNCHRONOUS_STATE_RECORDING", "1")
+            .env("CARGO_TARGET_DIR", fixture.root.join("target"))
+            .env_remove("CINDER_DISABLE_FAST_CHECK")
+            .output()
+            .unwrap()
+    };
+
+    // A selector at a default-members workspace root must not enter workspace
+    // capture; the shape stays entirely Cargo-owned.
+    let initial = check_lib(&fixture);
+    assert_success(&initial);
+    assert!(
+        !fixture.state_directory().join("check").exists(),
+        "a selector shape at a default-members root must not record workspace state"
+    );
+    let repeat = check_lib(&fixture);
+    assert_success(&repeat);
+    assert!(!stderr(&repeat).contains("Cinder reused"));
+}
+
+#[test]
+fn workspace_package_selection_reuses_a_multi_target_member() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "cinder-workspace-member-check-{}-{nonce}",
+        std::process::id()
+    ));
+    let member = root.join("tool");
+    fs::create_dir_all(member.join("src")).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"tool\"]\nresolver = \"3\"\n",
+    )
+    .unwrap();
+    fs::write(
+        member.join("Cargo.toml"),
+        "[package]\nname = \"tool\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    fs::write(member.join("src/lib.rs"), "pub fn value() -> u32 { 7 }\n").unwrap();
+    fs::write(
+        member.join("src/main.rs"),
+        "fn main() { println!(\"{}\", tool::value()); }\n",
+    )
+    .unwrap();
+    let fixture = Fixture {
+        source: member.join("src/main.rs"),
+        root,
+        package: Some("tool"),
+    };
+    let check_selected = |fixture: &Fixture| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cinder"));
+        command
+            .current_dir(&fixture.root)
+            .args(["check", "-p", "tool"]);
+        command
+            .env("CINDER_REAL_CARGO", "cargo")
+            .env("CINDER_FIXTURE_VALUE", "check")
+            .env("CINDER_SYNCHRONOUS_STATE_RECORDING", "1")
+            .env("CARGO_TARGET_DIR", fixture.root.join("target"))
+            .env_remove("CINDER_DISABLE_FAST_CHECK")
+            .output()
+            .unwrap()
+    };
+
+    assert_success(&check_selected(&fixture));
+    let reused = check_selected(&fixture);
+    assert_success(&reused);
+    assert!(
+        stderr(&reused).contains("Cinder reused the validated check of 2 targets"),
+        "workspace-selected multi-target member did not reuse:\n{}",
+        stderr(&reused)
+    );
+
+    fs::write(
+        &fixture.source,
+        "fn main() { println!(\"{}!\", tool::value()); }\n",
+    )
+    .unwrap();
+    let changed = check_selected(&fixture);
+    assert_success(&changed);
+    assert!(!stderr(&changed).contains("Cinder reused"));
+}
+
+#[test]
+fn explicit_default_members_keep_non_check_commands_on_cargo() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "cinder-default-members-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        concat!(
+            "[package]\nname = \"root-package\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n",
+            "[workspace]\nmembers = [\"extra\"]\ndefault-members = [\".\", \"extra\"]\nresolver = \"3\"\n",
+        ),
+    )
+    .unwrap();
+    fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+    workspace_member(&root, "extra", false, "pub fn extra() -> u32 { 9 }\n");
+    let fixture = Fixture {
+        source: root.join("src/main.rs"),
+        root,
+        package: None,
+    };
+
+    // Single-package capture would record only the root package while Cargo
+    // also builds `extra`; a later reuse could then return a stale result for
+    // the other member. Build therefore stays entirely Cargo-owned.
+    assert_success(&fixture.build());
+    assert!(!fixture.state_directory().join("build").exists());
+    let repeated = fixture.build();
+    assert_success(&repeated);
+    assert!(!stderr(&repeated).contains("Cinder reused"));
+    assert!(!fixture.state_directory().join("build").exists());
+
+    // Check uses workspace selection instead, validating every default member.
+    assert_success(&fixture.check_default());
+    let reused = fixture.check_default();
+    assert_success(&reused);
+    assert!(
+        stderr(&reused).contains("Cinder reused the validated check of 2 targets"),
+        "default-members workspace check did not select every member:\n{}",
+        stderr(&reused)
+    );
+
+    // A stale `extra` must invalidate that workspace check state.
+    fs::write(
+        fixture.root.join("extra/src/lib.rs"),
+        "pub fn extra() -> u32 { 10 }\n",
+    )
+    .unwrap();
+    let changed = fixture.check_default();
+    assert_success(&changed);
+    assert!(!stderr(&changed).contains("Cinder reused"));
+    assert!(stderr(&changed).contains("Checking extra"));
 }
 
 struct Fixture {
@@ -4735,7 +5625,9 @@ mod tests {{
 
     fn wait_for_state(&self, kind: &str) {
         let state = self.state_directory().join(kind).join("run-context");
-        for _ in 0..100 {
+        // The detached recorder now also runs hidden no-change Cargo passes,
+        // which a fully loaded test machine can starve for several seconds.
+        for _ in 0..750 {
             if state.is_file() {
                 return;
             }
