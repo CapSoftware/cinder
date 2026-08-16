@@ -478,27 +478,39 @@ Recipe format changes invalidate older captures.
 Compiler arguments are not the complete compiler input when procedural macros
 are involved. A stable procedural macro can call `std::env::var` while expanding
 the selected crate, including for values Cargo adds only to the compiler
-environment, without causing rustc to list that access in dep-info. The macOS
-`KERN_PROCARGS2` string area contains `argv`, `envp`, and Apple's auxiliary
-process strings. `argc` provides an exact boundary for arguments, but there is
-no equivalent environment count that lets Cinder prove where `envp` ends and
-the auxiliary vector begins. Cinder therefore stops reading at `argc` and does
-not use the remaining process-string tail as environment evidence.
-
-To close the ordinary-macro gap without storing arbitrary environment data,
-Cinder records per-recipe salted fingerprints of every present and absent
-environment dependency in Cargo's previous rustc dep-info. After rustc
+environment, without causing rustc to list that access in dep-info. Tracked
+accesses are covered without storing arbitrary environment data: Cinder
+records per-recipe salted fingerprints of every present and absent environment
+dependency in Cargo's previous rustc dep-info, and after a replayed rustc
 succeeds, each `env!` or `option_env!` access in the new dep-info must match a
-prior fingerprint. A newly introduced access or changed value rejects the
-replay and lets Cargo establish a new baseline; a later equivalent edit may
-then qualify. The fingerprints contain neither raw keys nor raw values and are
-format-bound so older recipes cannot bypass the check.
-Consequently, any `proc-macro` unit in Cargo's message stream disables recipe
-publication for the entire command. Cargo emits artifact messages for fresh
-units as well, and repeated-edit tests enforce that this guard remains active
-after the macro dependency is already built. A missing or malformed target-kind
-field also fails closed. Reconstructing likely Cargo variables is deliberately
-not treated as parity.
+prior fingerprint — a newly introduced access or changed value rejects the
+replay and lets Cargo establish a new baseline. The fingerprints contain
+neither raw keys nor raw values and are format-bound so older recipes cannot
+bypass the check.
+
+Untracked reads are covered by a probe-verified environment witness
+(`analysis/env-parity-probe-2026-08-16.md`). Once per toolchain and launch
+context, Cinder compiles an offline sentinel probe workspace — primary and
+dependency shapes, a build script, and a procedural macro that executes at
+expansion time — through real Cargo with Cinder itself as the compiler
+wrapper, recording the complete environment of every compiler process. Every
+injected variable must classify against a witnessed derivation (manifest
+field, version part, crate name, manifest location, launch-layer constant,
+`OUT_DIR`, the dynamic-loader path forms, or the jobserver variable, which is
+never restored); an unclassifiable variable marks the toolchain unsupported.
+During the probe builds the `KERN_PROCARGS2` environment tail — which has no
+`argc`-style count separating `envp` from Apple's auxiliary strings — is
+parsed and must reproduce the wrapper-recorded environment byte for byte,
+proving the parser exact on this machine before it is ever trusted. A real
+capture then stores a full-witnessed recipe only when every observed variable
+is byte-inherited from Cinder's controlled base environment, witnessed with
+its derivation cross-checked, or the jobserver name; a proc-macro unit in
+Cargo's message stream restricts recipe publication to full-witnessed
+recipes, so an untracked expansion-time read observes exactly the values
+Cargo would have provided. Unwitnessed variables, unprobed cargo versions,
+missing observations, or malformed target-kind fields leave such graphs
+refused exactly as before. Guessing likely Cargo variables is still
+deliberately not treated as parity — only witnessed evidence is.
 
 The macOS process-inspection interfaces used by the observer are best-effort
 and subject to operating-system change. Observation failure, an incomplete
