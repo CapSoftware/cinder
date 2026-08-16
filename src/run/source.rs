@@ -496,13 +496,29 @@ pub(super) fn changed_plain_literal(old: &[u8], new: &[u8]) -> Option<(Vec<u8>, 
     changed_literal_data(old_literal.bytes, new_literal.bytes)
 }
 
+/// Rejects literal data that rustc refuses to compile inside a string literal:
+/// a bare carriage return is a hard error, and the Unicode directional
+/// formatting codepoints are denied by default through
+/// `text_direction_codepoint_in_literal`. Accepting such bytes would patch an
+/// executable that a real Cargo build of the same source rejects.
+fn literal_data_is_compilable(data: &str) -> bool {
+    !data.chars().any(|character| {
+        character == '\r'
+            || matches!(
+                character,
+                '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+            )
+    })
+}
+
 pub(super) fn changed_literal_data(old: &[u8], new: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
-    if old.len() != new.len()
-        || old == new
-        || std::str::from_utf8(old).is_err()
-        || std::str::from_utf8(new).is_err()
-        || old.len() < 8
-    {
+    if old.len() != new.len() || old == new || old.len() < 8 {
+        return None;
+    }
+    let (Ok(old_text), Ok(new_text)) = (std::str::from_utf8(old), std::str::from_utf8(new)) else {
+        return None;
+    };
+    if !literal_data_is_compilable(old_text) || !literal_data_is_compilable(new_text) {
         return None;
     }
     if old.contains(&b'{') || old.contains(&b'}') || new.contains(&b'{') || new.contains(&b'}') {
