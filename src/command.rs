@@ -70,6 +70,12 @@ fn run_cargo_inner(
     if accelerated {
         return Ok(0);
     }
+    if matches!(
+        subcommand,
+        Some("build" | "b" | "check" | "c" | "run" | "r" | "test" | "t")
+    ) {
+        crate::run::restore_cached_units(&arguments);
+    }
     let capture_mode = if crate::run::artifact_capture_eligible(&arguments)? {
         let capture_compiler_recipes = matches!(subcommand, Some("check" | "c"))
             && env::var_os(crate::run::EXPERIMENTAL_DIRECT_CHECK).as_deref()
@@ -144,6 +150,10 @@ fn run_cargo_inner(
                     .any(|flag| argument == *flag || argument.starts_with(&format!("{flag}=")))
             })
         });
+    // Unit-cache scheduling resolves locations from the user's original
+    // arguments; the transformed argument list below adds capture flags that
+    // the resolution deliberately refuses.
+    let original_arguments_for_unit_record = arguments.clone();
     let arguments = crate::run::cargo_arguments(
         arguments,
         context_path.as_deref(),
@@ -166,6 +176,7 @@ fn run_cargo_inner(
             return Err(TUNED_SIGNAL_SENTINEL.to_owned());
         }
         if status.success() {
+            crate::run::schedule_unit_record(&original_arguments_for_unit_record);
             if captures_build {
                 crate::run::schedule_completed_build(
                     receipt_directory,
@@ -238,7 +249,9 @@ fn run_cargo_inner(
                 }
                 return Err(TUNED_SIGNAL_SENTINEL.to_owned());
             }
-            if !status.success() {
+            if status.success() {
+                crate::run::schedule_unit_record(&original_arguments_for_unit_record);
+            } else {
                 let _ = std::fs::remove_dir_all(receipt_directory);
                 if let Some(context_path) = context_path {
                     let _ = std::fs::remove_file(context_path);
