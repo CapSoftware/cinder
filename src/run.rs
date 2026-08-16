@@ -95,6 +95,7 @@ mod capture;
 mod cargo;
 mod context;
 mod diagnostics;
+mod envprobe;
 mod inputs;
 mod messages;
 mod observe;
@@ -112,6 +113,7 @@ pub use cargo::{artifact_capture_eligible, clear_project_state, test_execution_e
 pub use context::run_context;
 pub use context::run_context_with_cargo;
 pub use diagnostics::stage_cargo_invocation;
+pub use envprobe::EnvironmentWitness;
 pub use messages::{PackageSelection, run_cargo_messages, selected_package};
 
 use cache::{
@@ -1746,6 +1748,23 @@ pub fn record_test_state_command(arguments: Vec<OsString>) -> Result<u8, String>
         .map_err(|error| format!("could not read test state context: {error}"))?;
     let _ = record_completed_test(Path::new(&receipt_directory), &context)?;
     Ok(0)
+}
+
+/// The hidden `RUSTC_WRAPPER` mode used only during environment-witness
+/// generation: dump the invocation, then exec the real compiler.
+pub fn env_probe_wrapper_main(arguments: &[OsString]) -> Option<u8> {
+    envprobe::wrapper_main(arguments)
+}
+
+/// Loads or lazily generates the per-toolchain compiler-environment witness.
+/// Only the experimental recipe-capture path calls this; everything about it
+/// fails closed to a missing witness.
+pub fn compiler_environment_witness(cargo: &Path) -> Option<EnvironmentWitness> {
+    envprobe::witness_for(cargo)
+}
+
+pub fn clear_environment_witnesses() -> Result<(), String> {
+    envprobe::clear_witnesses()
 }
 
 fn read_artifact_receipts(directory: &Path) -> Result<Vec<ArtifactReceipt>, String> {
