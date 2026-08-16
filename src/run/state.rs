@@ -1014,6 +1014,281 @@ impl State {
         result
     }
 
+    /// Records one validated state for a command that selected several root
+    /// units, such as a lib-and-bin package `check` or a workspace-root
+    /// `check`. The lexicographically first root is the primary artifact; the
+    /// remaining roots become siblings whose reachable unit graphs are merged
+    /// into the primary Cargo output graph. Multi-root states never enter
+    /// revision history and never index patchable literals.
+    pub(super) fn record_fresh_multi(
+        directory: &Path,
+        kind: StateKind,
+        roots: &[(PathBuf, ArtifactReceipt)],
+        run_context: &[u8],
+        diagnostics: DiagnosticsReplay,
+        command_started_ns: u128,
+    ) -> Result<(), String> {
+        if !matches!(kind, StateKind::Build | StateKind::Check) {
+            return Err("multi-root state is limited to build and check commands".to_owned());
+        }
+        let Some(((primary_artifact, primary_receipt), sibling_selection)) = roots.split_first()
+        else {
+            return Err("multi-root state requires at least one selected artifact".to_owned());
+        };
+        if roots.len() > MAX_STATE_ROOTS {
+            return Err("Cargo selected more root units than Cinder records".to_owned());
+        }
+
+        let mut observes_underscore = false;
+        let mut union_fingerprints = BTreeSet::new();
+        let mut union_dependency_files = BTreeSet::new();
+        let mut union_artifacts = BTreeSet::new();
+        let mut union_fingerprint_files = std::collections::BTreeMap::new();
+        let mut union_encoded_paths = BTreeSet::new();
+        let mut union_build_scripts = BTreeSet::new();
+        let mut per_root_outputs = Vec::with_capacity(roots.len());
+        for (artifact, receipt) in roots {
+            let outputs = cargo_outputs_for_artifact(artifact, Some(receipt))?;
+            let unit_graph = compiler_unit_graph(&outputs, b"_")?;
+            observes_underscore |= unit_graph.observes_environment;
+            union_fingerprints.extend(unit_graph.fingerprints);
+            union_dependency_files.extend(unit_graph.dependency_files);
+            union_artifacts.extend(unit_graph.artifacts);
+            for entry in unit_graph.fingerprint_files {
+                match union_fingerprint_files.get(&entry.path) {
+                    Some(existing) if *existing != entry.identity => {
+                        return Err(
+                            "Cargo fingerprint identity diverged across selected units".to_owned()
+                        );
+                    }
+                    Some(_) => {}
+                    None => {
+                        union_fingerprint_files.insert(entry.path, entry.identity);
+                    }
+                }
+            }
+            union_encoded_paths.extend(unit_graph.encoded_dependency_paths);
+            union_build_scripts.extend(unit_graph.build_script_directories);
+            per_root_outputs.push(outputs);
+        }
+        // Every executed build script must be reachable from some selected
+        // root; the message receipts carry the whole-command script graph.
+        let mut receipt_directories = BTreeSet::new();
+        for output in &primary_receipt.build_script_outputs {
+            let script_directory = output.out_directory.parent().ok_or_else(|| {
+                format!(
+                    "Cargo build-script output has no parent: {}",
+                    output.out_directory.display()
+                )
+            })?;
+            receipt_directories.insert(fs::canonicalize(script_directory).map_err(|error| {
+                format!(
+                    "could not resolve Cargo build-script receipt {}: {error}",
+                    script_directory.display()
+                )
+            })?);
+        }
+        if receipt_directories != union_build_scripts {
+            return Err(
+                "Cargo build-script message graph does not match its fingerprint graph".to_owned(),
+            );
+        }
+        // A root whose own package declares a build script must carry that
+        // script's exact output receipt.
+        for (_, receipt) in roots {
+            let manifest_directory = receipt
+                .manifest_directory
+                .as_deref()
+                .ok_or_else(|| "Cargo artifact receipt has no package manifest".to_owned())?;
+            if package_may_have_build_script(manifest_directory)? && receipt.out_directory.is_none()
+            {
+                return Err(
+                    "Cargo produced no build-script output receipt for a package with a build script; using Cargo"
+                        .to_owned(),
+                );
+            }
+        }
+
+        let mut source_set = BTreeSet::new();
+        let mut per_root_sources = Vec::with_capacity(roots.len());
+        for ((artifact, _), outputs) in roots.iter().zip(&per_root_outputs) {
+            let source_dependency_file = if artifact_is_executable(artifact) {
+                let public_dependency_file = artifact.with_extension("d");
+                if public_dependency_file.is_file() {
+                    public_dependency_file
+                } else {
+                    outputs.dependency_file.clone()
+                }
+            } else {
+                outputs.dependency_file.clone()
+            };
+            let root_sources = build_source_paths(directory, artifact, &source_dependency_file)?;
+            source_set.extend(root_sources.iter().cloned());
+            per_root_sources.push(root_sources);
+        }
+        let sources: Vec<PathBuf> = source_set.into_iter().collect();
+
+        let mut cargo_outputs = per_root_outputs[0].clone();
+        cargo_outputs.unit_fingerprints = union_fingerprints.into_iter().collect();
+        cargo_outputs.unit_dependency_files = union_dependency_files.into_iter().collect();
+        cargo_outputs.unit_artifacts = union_artifacts.into_iter().collect();
+        cargo_outputs.unit_fingerprint_files = union_fingerprint_files
+            .into_iter()
+            .map(|(path, identity)| CargoOutputEntry { path, identity })
+            .collect();
+        let union_encoded_paths: Vec<PathBuf> = union_encoded_paths.into_iter().collect();
+        let recorded_context = bind_observed_shell_environment(run_context, observes_underscore);
+        let program_name = primary_artifact
+            .file_name()
+            .ok_or_else(|| {
+                format!(
+                    "Cargo artifact has no file name: {}",
+                    primary_artifact.display()
+                )
+            })?
+            .to_owned();
+
+        let capture = state_directory(directory, kind)
+            .with_extension(format!("capture-{}", std::process::id()));
+        if capture.exists() {
+            fs::remove_dir_all(&capture)
+                .map_err(|error| format!("could not reset source capture: {error}"))?;
+        }
+        fs::create_dir_all(&capture)
+            .map_err(|error| format!("could not create source capture: {error}"))?;
+        make_private_directory(&capture)?;
+        let result = (|| {
+            snapshot_sources(directory, &capture, &sources)?;
+            // Each root bounds its own consumed sources: a rebuilt root's
+            // artifact timestamp, or the staged invocation (written before
+            // the Cargo child) for a fresh root, whose sources Cargo verified
+            // against an older artifact. A source newer than its root's bound
+            // may be a mid-command edit that root never saw; accepting it
+            // would bind new source content to a stale sibling artifact.
+            let mut earliest_rebuilt_ns: Option<u128> = None;
+            for ((artifact, _), root_sources) in roots.iter().zip(&per_root_sources) {
+                let (_, artifact_modified_ns) = artifact_metadata(artifact)?;
+                if artifact_modified_ns > command_started_ns {
+                    earliest_rebuilt_ns =
+                        Some(earliest_rebuilt_ns.map_or(artifact_modified_ns, |bound| {
+                            bound.min(artifact_modified_ns)
+                        }));
+                }
+                let root_bound_ns = artifact_modified_ns.max(command_started_ns);
+                for source in root_sources {
+                    let (_, modified_ns) = artifact_metadata(&directory.join(source))?;
+                    if modified_ns > root_bound_ns {
+                        return Err(format!(
+                            "{} changed after the Cargo command started",
+                            source.display()
+                        ));
+                    }
+                }
+            }
+            // Inputs use the widest bound: Cargo itself rewrites control
+            // files such as Cargo.lock after the command starts but before
+            // any unit compiles.
+            let mut freshness_bound_ns = command_started_ns;
+            if let Some(earliest_rebuilt_ns) = earliest_rebuilt_ns {
+                freshness_bound_ns = earliest_rebuilt_ns;
+            }
+            let (project_topology, project_inputs) =
+                project_topology_and_inputs(directory, primary_artifact)?;
+            let inputs = build_inputs(
+                directory,
+                primary_artifact,
+                &sources,
+                BuildInputGraph {
+                    dependency_file: &cargo_outputs.dependency_file,
+                    unit_dependency_files: &cargo_outputs.unit_dependency_files,
+                    encoded_dependency_paths: &union_encoded_paths,
+                    receipt: Some(primary_receipt),
+                    project_inputs: Some(&project_inputs),
+                },
+            )?;
+            if inputs
+                .iter()
+                .any(|input| input.identity.modified_ns > freshness_bound_ns)
+                || !input_entries_are_unchanged(&inputs)
+                || !project_topology_is_unchanged(&project_topology, directory, primary_artifact)?
+                || !sources_are_unchanged(directory, &capture, &sources)?
+            {
+                return Err("build inputs changed while recording build state".to_owned());
+            }
+            let (artifact_file_identity, artifact_digest) = artifact_identity(primary_artifact)?;
+            let mut sibling_roots = Vec::with_capacity(sibling_selection.len());
+            for ((artifact, _), outputs) in
+                sibling_selection.iter().zip(per_root_outputs[1..].iter())
+            {
+                let (identity, digest) = artifact_identity(artifact)?;
+                sibling_roots.push(SiblingRoot {
+                    artifact: artifact.clone(),
+                    artifact_file_identity: identity,
+                    artifact_digest: digest,
+                    dependency_file: outputs.dependency_file.clone(),
+                    hashed_artifact: outputs.artifact.clone(),
+                    fingerprint: outputs.fingerprint.clone(),
+                });
+            }
+            let (source_records, source_digest) =
+                verified_source_records(directory, &capture, &sources)?;
+            Self::publish(
+                directory,
+                kind,
+                StatePublication {
+                    source_root: &capture,
+                    source_digest: &source_digest,
+                    artifact: primary_artifact,
+                    artifact_file_identity: &artifact_file_identity,
+                    artifact_digest: Some(&artifact_digest),
+                    public_artifact: primary_artifact,
+                    program_name: &program_name,
+                    literal_index: &[],
+                    run_context: &recorded_context,
+                    observes_underscore,
+                    inputs: &inputs,
+                    project_topology: &project_topology,
+                    sources: &sources,
+                    source_records: &source_records,
+                    cargo_outputs: &cargo_outputs,
+                    cargo_fingerprints_current: true,
+                    runtime_environment: &[],
+                    runtime_directory: None,
+                    compiler_recipe: None,
+                    diagnostics: &diagnostics,
+                    sibling_roots: &sibling_roots,
+                    duplicate_ready: false,
+                },
+            )
+            // Multi-root states are current-state-only: revision history
+            // restores exactly one artifact, so no cache_current here.
+        })();
+        let _ = fs::remove_dir_all(capture);
+        result
+    }
+
+    /// Validates every recorded sibling root's artifact identity and exact
+    /// root outputs. Sibling reachable unit graphs were merged into the
+    /// primary Cargo output graph at recording time, so fingerprint content
+    /// is validated there.
+    pub(super) fn sibling_roots_are_unchanged(&self) -> Result<bool, String> {
+        for sibling in &self.sibling_roots {
+            let identity = match artifact_file_identity(&sibling.artifact) {
+                Ok(identity) => identity,
+                Err(_) if !sibling.artifact.exists() => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            if identity != sibling.artifact_file_identity
+                || !sibling.dependency_file.is_file()
+                || !sibling.hashed_artifact.is_file()
+                || !sibling.fingerprint.is_dir()
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     pub(super) fn record_patched(
         &self,
         directory: &Path,
@@ -1152,6 +1427,11 @@ impl State {
         let Some(state) = Self::load(directory, kind)? else {
             return Ok(());
         };
+        // Multi-root states are current-state-only; revision history restores
+        // exactly one artifact, so a sibling-bearing state is never retained.
+        if !state.sibling_roots.is_empty() {
+            return Ok(());
+        }
         let Some(artifact_digest) = state.artifact_digest else {
             return Ok(());
         };
