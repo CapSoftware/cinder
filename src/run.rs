@@ -94,6 +94,7 @@ mod cache;
 mod capture;
 mod cargo;
 mod context;
+mod diagnostics;
 mod inputs;
 mod messages;
 mod observe;
@@ -110,6 +111,7 @@ pub use cargo::{artifact_capture_eligible, clear_project_state, test_execution_e
 #[cfg(test)]
 pub use context::run_context;
 pub use context::run_context_with_cargo;
+pub use diagnostics::stage_cargo_invocation;
 pub use messages::{PackageSelection, run_cargo_messages, selected_package};
 
 use cache::{
