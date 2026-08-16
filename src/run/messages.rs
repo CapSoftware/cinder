@@ -971,9 +971,16 @@ fn cargo_artifact_receipt(
     let [crate_type] = crate_types.as_slice() else {
         return Ok(None);
     };
+    // "proc-macro" is ordinary no-change evidence: the unit's hashed
+    // artifact, dep-info, and fingerprint are validated like any other
+    // check output, and macro-time environment reads are bound by the
+    // whole-environment context identity. This is narrower than replaying a
+    // compiler process: the experimental recipe path keeps rejecting any
+    // graph containing a proc-macro target, and that guard reads target
+    // kinds from the message stream independently of receipt conversion.
     if !matches!(
         *crate_type,
-        "bin" | "lib" | "rlib" | "staticlib" | "dylib" | "cdylib"
+        "bin" | "lib" | "rlib" | "staticlib" | "dylib" | "cdylib" | "proc-macro"
     ) {
         return Ok(None);
     }
@@ -1041,8 +1048,25 @@ fn cargo_artifact_receipt(
         let [public_artifact] = filenames.as_slice() else {
             return Err("Cargo linked artifact has ambiguous outputs".to_owned());
         };
-        let (artifact, dependency_file) = linked_artifact_for_public(target_name, public_artifact)?;
-        (artifact, dependency_file, public_artifact.clone())
+        // A used proc-macro's compiled dylib is a hashed dependency-directory
+        // artifact whose dep-info follows the metadata naming rule (`lib`
+        // stripped, same hash). Unhashed single outputs remain public
+        // artifacts mapped through the dependency directory.
+        let direct_dependency = artifact_name_has_hash(public_artifact)
+            .then(|| dependency_file_for_metadata(public_artifact).ok())
+            .flatten()
+            .filter(|dependency_file| dependency_file.is_file());
+        if let Some(dependency_file) = direct_dependency {
+            (
+                public_artifact.clone(),
+                dependency_file,
+                public_artifact.clone(),
+            )
+        } else {
+            let (artifact, dependency_file) =
+                linked_artifact_for_public(target_name, public_artifact)?;
+            (artifact, dependency_file, public_artifact.clone())
+        }
     };
     if !artifact.is_file() || !dependency_file.is_file() || !public_artifact.is_file() {
         return Err("Cargo artifact outputs are incomplete".to_owned());
