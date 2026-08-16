@@ -1,0 +1,20 @@
+{
+ "fd-test": {
+  "ok": true,
+  "results": [
+   "test result: ok. 157 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+   "test result: ok. 108 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.82s"
+  ]
+ },
+ "ripgrep-test": {
+  "ok": false,
+  "results": [
+   "test result: ok. 25 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+   "test result: ok. 77 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.65s",
+   "test result: ok. 137 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s",
+   "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+   "test result: ok. 114 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+   "test result: ok. 298 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.07s"
+  ]
+ }
+}

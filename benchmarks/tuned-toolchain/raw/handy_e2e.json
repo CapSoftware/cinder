@@ -1,0 +1,28 @@
+{
+ "cinder": {
+  "edit_median_s": 3.46,
+  "edit_samples_s": [
+   3.63,
+   3.43,
+   3.34,
+   3.55,
+   3.15,
+   3.48
+  ],
+  "nochange_median_s": 0.317,
+  "tuned_ns": true
+ },
+ "cargo": {
+  "edit_median_s": 3.1,
+  "edit_samples_s": [
+   3.0,
+   3.33,
+   2.99,
+   3.22,
+   2.96,
+   3.2
+  ],
+  "nochange_median_s": 0.283,
+  "tuned_ns": true
+ }
+}

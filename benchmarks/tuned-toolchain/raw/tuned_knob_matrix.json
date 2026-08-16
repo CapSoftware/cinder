@@ -1,0 +1,46 @@
+{
+ "stable": {
+  "cold_s": 51.3,
+  "edit_samples_s": [
+   3.9,
+   2.06,
+   2.55,
+   2.0,
+   2.43,
+   2.05
+  ],
+  "edit_median_s": 2.25
+ },
+ "nightly": {
+  "cold_s": null,
+  "error": "er/target/cinder-bench/repos/bun/src/sha_hmac)\nSome errors have detailed explanations: E0599, E0658.\nFor more information about an error, try `rustc --explain E0599`.\nerror: could not compile `bun_collections` (lib) due to 3 previous errors\nwarning: build failed, waiting for other jobs to finish...\n"
+ },
+ "nightly-zt8": {
+  "cold_s": null,
+  "error": "re(isolate_most_least_significant_one)]\n    |\n\nSome errors have detailed explanations: E0599, E0658.\nFor more information about an error, try `rustc --explain E0599`.\nerror: could not compile `bun_collections` (lib) due to 3 previous errors\nwarning: build failed, waiting for other jobs to finish...\n"
+ },
+ "nightly-clif": {
+  "cold_s": null,
+  "error": "er/target/cinder-bench/repos/bun/src/sha_hmac)\nSome errors have detailed explanations: E0599, E0658.\nFor more information about an error, try `rustc --explain E0599`.\nerror: could not compile `bun_collections` (lib) due to 3 previous errors\nwarning: build failed, waiting for other jobs to finish...\n"
+ },
+ "nightly-zt8-clif": {
+  "cold_s": null,
+  "error": "re(isolate_most_least_significant_one)]\n    |\n\nSome errors have detailed explanations: E0599, E0658.\nFor more information about an error, try `rustc --explain E0599`.\nerror: could not compile `bun_collections` (lib) due to 3 previous errors\nwarning: build failed, waiting for other jobs to finish...\n"
+ },
+ "tuned": {
+  "cold_s": null,
+  "error": "14:1\n   |\n14 | #![feature(hasher_prefixfree_extras)]\n   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\n   Compiling bun_hash v0.0.0 (/Users/richie/Documents/github/cinder/target/cinder-bench/repos/bun/src/hash)\nFor more information about this error, try `rustc --explain E0554`.\nerror: could not compile `bun_wyhash` (lib) due to 1 previous error\nwarning: build failed, waiting for other jobs to finish...\n"
+ },
+ "tuned-zt8": {
+  "cold_s": null,
+  "error": "bun_core/Global.rs:684:9\n    |\n684 | #[allow(suspicious_runtime_symbol_definitions)] // signatures are ABI-identical; `safe fn` is intentional (above)\n    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    |\n    = note: `-D unknown-lints` implied by `-D warnings`\n    = help: to override `-D warnings` add `#[allow(unknown_lints)]`\n\nerror: could not compile `bun_core` (lib) due to 1 previous error\n"
+ },
+ "tuned-clif": {
+  "cold_s": null,
+  "error": "[sp, #-32]!\n           mov fp, sp\n           str x19, [sp, #24]\n           mov x19, x0\n           ldr x0, [x19, 0x0]\n       /* x0 */\n           str x0, [x19, 0x0]\n           ldr x19, [sp, #24]\n           ldp fp, lr, [sp], #32\n           ret\n       \n       \n       `\n\nerror: could not compile `constant_time_eq` (lib) due to 1 previous error\nwarning: build failed, waiting for other jobs to finish...\n"
+ },
+ "tuned-zt8-clif": {
+  "cold_s": null,
+  "error": "[sp, #-32]!\n           mov fp, sp\n           str x19, [sp, #24]\n           mov x19, x0\n           ldr x0, [x19, 0x0]\n       /* x0 */\n           str x0, [x19, 0x0]\n           ldr x19, [sp, #24]\n           ldp fp, lr, [sp], #32\n           ret\n       \n       \n       `\n\nerror: could not compile `constant_time_eq` (lib) due to 1 previous error\nwarning: build failed, waiting for other jobs to finish...\n"
+ }
+}

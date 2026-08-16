@@ -1,0 +1,110 @@
+{
+ "ripgrep/cinder": {
+  "cold_median_s": 3.12,
+  "cold_samples_s": [
+   3.75,
+   3.12,
+   3.04
+  ],
+  "edit_median_s": 0.504,
+  "edit_samples_s": [
+   0.479,
+   0.501,
+   0.503,
+   0.519,
+   0.505,
+   0.53
+  ],
+  "tuned_namespace": true,
+  "stock_debug_dir": false
+ },
+ "ripgrep/cargo": {
+  "cold_median_s": 3.56,
+  "cold_samples_s": [
+   3.84,
+   3.56,
+   3.49
+  ],
+  "edit_median_s": 0.504,
+  "edit_samples_s": [
+   0.496,
+   0.508,
+   0.499,
+   0.517,
+   0.501,
+   0.551
+  ]
+ },
+ "cinder/cinder": {
+  "cold_median_s": 2.48,
+  "cold_samples_s": [
+   2.6,
+   2.47,
+   2.48
+  ],
+  "edit_median_s": 0.421,
+  "edit_samples_s": [
+   0.413,
+   0.42,
+   0.413,
+   0.423,
+   0.446,
+   0.423
+  ],
+  "tuned_namespace": true,
+  "stock_debug_dir": false
+ },
+ "cinder/cargo": {
+  "cold_median_s": 3.49,
+  "cold_samples_s": [
+   3.49,
+   3.39,
+   3.49
+  ],
+  "edit_median_s": 0.449,
+  "edit_samples_s": [
+   0.435,
+   0.452,
+   0.449,
+   0.448,
+   0.455,
+   0.442
+  ]
+ },
+ "fd/cinder": {
+  "cold_median_s": 3.37,
+  "cold_samples_s": [
+   3.77,
+   3.26,
+   3.37
+  ],
+  "edit_median_s": 0.381,
+  "edit_samples_s": [
+   0.37,
+   0.379,
+   0.39,
+   0.383,
+   0.371,
+   0.383
+  ],
+  "tuned_namespace": true,
+  "stock_debug_dir": false
+ },
+ "fd/cargo": {
+  "cold_median_s": 3.5,
+  "cold_samples_s": [
+   4.45,
+   3.44,
+   3.5
+  ],
+  "edit_median_s": 0.378,
+  "edit_samples_s": [
+   0.367,
+   0.379,
+   0.377,
+   0.376,
+   0.382,
+   0.381
+  ]
+ }
+}

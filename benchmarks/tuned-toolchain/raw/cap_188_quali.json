@@ -1,0 +1,104 @@
+{
+ "scap/pin-stock": {
+  "cold_median_s": 15.53,
+  "cold_samples_s": [
+   22.26,
+   15.53,
+   15.26
+  ],
+  "edit_median_s": 0.583,
+  "edit_samples_s": [
+   0.609,
+   0.585,
+   0.595,
+   0.581,
+   0.563,
+   0.547
+  ]
+ },
+ "scap/tuned": {
+  "cold_median_s": 15.25,
+  "cold_samples_s": [
+   22.21,
+   15.25,
+   14.72
+  ],
+  "edit_median_s": 0.548,
+  "edit_samples_s": [
+   0.55,
+   0.542,
+   0.545,
+   0.555,
+   0.566,
+   0.542
+  ]
+ },
+ "scap/tuned-zt8": {
+  "cold_median_s": 14.76,
+  "cold_samples_s": [
+   20.78,
+   14.76,
+   14.42
+  ],
+  "edit_median_s": 0.559,
+  "edit_samples_s": [
+   0.544,
+   0.549,
+   0.554,
+   0.585,
+   0.566,
+   0.565
+  ]
+ },
+ "cursor/pin-stock": {
+  "cold_median_s": 17.7,
+  "cold_samples_s": [
+   18.65,
+   17.7,
+   17.56
+  ],
+  "edit_median_s": 0.345,
+  "edit_samples_s": [
+   0.346,
+   0.344,
+   0.344,
+   0.35,
+   0.355,
+   0.344
+  ]
+ },
+ "cursor/tuned": {
+  "cold_median_s": 16.63,
+  "cold_samples_s": [
+   16.29,
+   16.63,
+   17.02
+  ],
+  "edit_median_s": 0.356,
+  "edit_samples_s": [
+   0.356,
+   0.351,
+   0.349,
+   0.366,
+   0.356,
+   0.385
+  ]
+ },
+ "cursor/tuned-zt8": {
+  "cold_median_s": 17.49,
+  "cold_samples_s": [
+   17.15,
+   17.74,
+   17.49
+  ],
+  "edit_median_s": 0.368,
+  "edit_samples_s": [
+   0.362,
+   0.372,
+   0.364,
+   0.376,
+   0.371,
+   0.365
+  ]
+ }
+}

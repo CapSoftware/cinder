@@ -1,0 +1,53 @@
+{
+ "cap-pinned-1.88": {
+  "cold_median_s": 15.11,
+  "cold_samples_s": [
+   27.73,
+   14.93,
+   15.11
+  ],
+  "edit_median_s": 0.536,
+  "edit_samples_s": [
+   0.534,
+   0.535,
+   0.533,
+   0.538,
+   0.545,
+   0.539
+  ]
+ },
+ "cap-stock-1.93": {
+  "cold_median_s": 15.83,
+  "cold_samples_s": [
+   22.69,
+   15.6,
+   15.83
+  ],
+  "edit_median_s": 0.545,
+  "edit_samples_s": [
+   0.535,
+   0.54,
+   0.551,
+   0.542,
+   0.549,
+   0.548
+  ]
+ },
+ "cap-tuned-1.93": {
+  "cold_median_s": 16.32,
+  "cold_samples_s": [
+   21.76,
+   15.91,
+   16.32
+  ],
+  "edit_median_s": 0.563,
+  "edit_samples_s": [
+   0.561,
+   0.555,
+   0.562,
+   0.566,
+   0.564,
+   0.57
+  ]
+ }
+}

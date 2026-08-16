@@ -1,0 +1,46 @@
+{
+ "scap-build/cinder": {
+  "cold_median_s": 14.33,
+  "cold_samples_s": [
+   21.22,
+   14.09,
+   14.33
+  ],
+  "edit_median_s": 0.552,
+  "nochange_median_s": 0.016,
+  "tuned_namespace": true
+ },
+ "scap-build/cargo": {
+  "cold_median_s": 15.24,
+  "cold_samples_s": [
+   21.57,
+   15.06,
+   15.24
+  ],
+  "edit_median_s": 0.535,
+  "nochange_median_s": 0.24,
+  "tuned_namespace": false
+ },
+ "cursor-check/cinder": {
+  "cold_median_s": 15.98,
+  "cold_samples_s": [
+   15.98,
+   15.67,
+   16.93
+  ],
+  "edit_median_s": 0.352,
+  "nochange_median_s": 0.013,
+  "tuned_namespace": true
+ },
+ "cursor-check/cargo": {
+  "cold_median_s": 19.09,
+  "cold_samples_s": [
+   19.18,
+   18.69,
+   19.09
+  ],
+  "edit_median_s": 0.374,
+  "nochange_median_s": 0.274,
+  "tuned_namespace": false
+ }
+}
