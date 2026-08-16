@@ -8,9 +8,14 @@ reviewable without introducing additional runtime layers:
 - `run.rs` coordinates the fast paths, locking, recording, and process launch;
 - `run/context.rs` identifies commands, environments, toolchains, and Cargo's
   selected compiler-unit graph;
-- `run/capture.rs` records compiler receipts and normalizes Cargo arguments;
+- `run/capture.rs` normalizes Cargo and compiler arguments;
 - `run/cargo.rs` owns command eligibility, configuration guards, and clean
   integration;
+- `run/messages.rs` consumes Cargo's stable JSON artifact stream and records
+  exact outputs without changing the compiler environment;
+- `run/observe.rs` performs best-effort, read-only observation of a Cargo child
+  on macOS for the opt-in compiler-recipe experiment;
+- `run/replay.rs` validates, stores, and replays those experimental recipes;
 - `run/state.rs` loads, publishes, promotes, and matches validated state;
 - `run/cache.rs` owns cache layout, revision retention, and stale-artifact
   collection;
@@ -19,6 +24,11 @@ reviewable without introducing additional runtime layers:
   analysis;
 - `run/patch.rs` performs artifact cloning, patching, and code-signature
   preservation.
+- `usage.rs` records opt-in, privacy-safe acceleration outcomes without adding
+  I/O to default command execution.
+- `run_windows.rs` and `usage_windows.rs` provide a compile-checked strict Cargo
+  proxy on Windows. They expose no artifact fast path until Windows has an
+  equivalent filesystem-identity, publication, and process-launch proof.
 
 These are ordinary Rust modules rather than dynamic abstraction layers. The
 compiler monomorphizes and inlines across them normally, so the split changes
@@ -31,6 +41,9 @@ resolution, feature selection, build scripts, proc macros, toolchains, or the
 workspace graph. Standard Cargo remains authoritative for those contracts.
 Unknown commands and all currently unsupported optimization cases are delegated
 with their arguments, environment, exit status, stdout, and stderr intact.
+Linux and Windows currently take this proxy path for every command. This keeps
+Cargo command parity portable without treating a successful cross-compile as
+runtime acceleration evidence.
 
 For eligible development `run` commands, Cinder adds a target runner through a
 Cargo `--config` value. Cargo still selects and builds the target and prepares
@@ -39,24 +52,50 @@ Cargo build, including Cargo's runtime dynamic-library path, and then executes
 it with the original program name and arguments. This is why existing Tauri
 watching, dynamic dependencies, and relaunch behavior continue to work.
 
-Eligible development `build` commands run Cargo as a child on a miss so Cinder
-can record the successfully produced artifact afterward. Cinder installs
-itself as a transparent `RUSTC_WRAPPER` for that invocation and chains any
-existing wrapper. Cargo remains responsible for every compiler invocation;
-the wrapper records primary linked artifacts, their exact hashed artifact and
-dep-info paths, target name/type, manifest directory, and build-script output
-directory. Cinder proceeds only when target selection resolves to one
-unambiguous public artifact. Explicit single-bin, single-lib, and
-single-example builds are supported; unselected packages that emit multiple
-primary artifacts remain on Cargo.
+Eligible development `run`, `build`, `check`, and selected test commands run
+Cargo as a child on a miss. Cinder asks Cargo for
+`json-render-diagnostics`: Cargo continues rendering normal status and compiler
+diagnostics to stderr, while its documented stdout records identify exact
+compiler artifacts and build-script output directories. Cinder consumes only
+known Cargo records through `build-finished`; unknown output is forwarded, and
+all later bytes are application output and are forwarded without parsing.
 
-Eligible `check` and `test --no-run` commands use the same transparent wrapper
-only to capture Cargo's successful primary compiler unit. A check must resolve
-to one unambiguous unit. Test reuse is narrower: `--no-run` must precede the
-test-harness argument delimiter and exactly one bin, example, library, or named
-integration test must be selected. Normal test execution, workspace-wide
-selections, machine-readable artifact output, and ambiguous unit sets remain
-entirely Cargo-owned.
+Before enabling capture, Cinder establishes one exact selected package. For a
+normal package-directory invocation without `-p`, it matches Cargo's artifact
+message to the canonical manifest path after verifying that the manifest has a
+package table. Workspace package selections are resolved to Cargo's exact
+package ID; that result is cached under the hashed command context so repeated
+first-seen edits do not spawn a second Cargo process just for resolution. The
+cache is owner-local, bounded, context-bound, cleared by `cinder clean`, and
+self-invalidates whenever the message stream has no artifact for the cached ID.
+
+Unsupported Cargo implementations, ambiguous default workspace members,
+complex package selections that cannot be resolved exactly, and failed probes
+disable capture and preserve the original command unchanged. The successful
+message path records primary linked artifacts, exact hashed artifacts and
+dep-info, target type, manifest directory, and selected build-script output.
+Cinder proceeds only when later artifact selection is unambiguous. Explicit
+single-bin, single-lib, single-example, and narrow check/test targets are
+supported; ambiguous output sets remain on Cargo.
+
+Neither default capture nor the opt-in recipe experiment installs or replaces
+`RUSTC_WRAPPER`, and Cinder's internal receipt controls are not placed in
+Cargo's environment. Projects with an existing environment- or
+configuration-defined compiler wrapper remain entirely Cargo-owned, preserving
+arbitrary wrapper behavior rather than assuming it is safe to skip. On macOS,
+the opt-in experiment only observes processes started by Cinder's own Cargo
+child. If observation is unavailable or misses the selected compiler process,
+no recipe is recorded and the next edit remains Cargo-owned.
+
+Test reuse remains narrower. Build-only reuse requires command-level `--no-run`
+before the test-harness argument delimiter and exactly one selected bin,
+example, library, or named integration test. Direct execution is narrower
+again: only one standard library harness selected by `test --lib`, optionally
+with one exact `-p`/`--package` selection, is eligible. Named and integration
+targets, `harness = false`,
+positional Cargo test filters, custom target runners, workspace-wide selections,
+machine-readable artifact output requested by the user, and ambiguous unit sets
+remain entirely Cargo-owned.
 
 ## Guarded fast paths
 
@@ -65,7 +104,8 @@ handles one narrow class of new executable edits. A bounded revision history
 restores an exact artifact that Cargo already built for an earlier validated
 source and input state. A no-change validation path skips Cargo's graph walk
 for selected check/test outputs that still have their complete exact Cargo
-state.
+state; for the narrow standard-library test shape, it then runs the exact
+validated Cargo-built harness rather than suppressing test execution.
 
 The first optimization targets small data-only edits: equal-byte-length UTF-8
 changes to either an ordinary unescaped Rust string or the data after the sole
@@ -123,9 +163,12 @@ Publication SHA-256 verifies each cached artifact before making it read-only.
 The immutable receipt records its size, modification and change timestamps,
 device, and inode, so later history hits avoid rereading a large archive or
 executable while still rejecting replacement, writes, permission changes, and
-metadata-restored tampering. The live Rust source set is content-hashed once
-and compared with each candidate's recorded digest; only the matching
-candidate's snapshot is then revalidated.
+metadata-restored tampering. A lightweight prefilter reads only each candidate's
+context, artifact, source manifest, and recorded source digest. The live Rust
+source set is content-hashed once and compared with those digests; only a
+source-matching candidate is fully decoded. Its context, target, source,
+artifact, Cargo-output, input-graph, history-key, snapshot, and cached-artifact
+checks all remain mandatory before publication.
 
 Patched Mach-O artifacts preserve and post-verify ad-hoc signature identifiers,
 entitlements, requirements, hardened-runtime flags, and launch/library
@@ -157,7 +200,7 @@ Selection and publication are serialized by the selected target's lock and
 cached artifacts are digest-bound. This prevents two Cinder processes from
 promoting different revisions through the same public artifact concurrently.
 
-## Exact no-change check and test reuse
+## Exact no-change check and test execution
 
 Check and selected `test --no-run` state is current-state only; it is never
 placed in revision history. Before returning success without Cargo, Cinder
@@ -167,11 +210,34 @@ directory plus every linked unit fingerprint in its dependency graph, complete
 source revision, control inputs, and build-script inputs. Any missing or changed
 component is a normal Cargo miss.
 
-Normal `cargo test` is never intercepted. Only one explicitly selected bin,
-example, library, or named integration test with command-level `--no-run` is
-eligible, and arguments after `--` cannot enable the optimization. Combined or
-implicit target sets remain Cargo-owned. This preserves test execution and
-harness argument semantics.
+The three bounded persisted graphs (inputs, project topology, and Cargo
+outputs) are each opened and read once, size-checked before allocation, decoded
+from an in-memory slice, and rejected on truncation or trailing data. Cargo's
+reachable output graph and the independent input graph are then validated in
+parallel while the target lock is held. A panic or error on either side is a
+cache miss, never a successful decision.
+
+For command-level `--no-run`, only one explicitly selected bin, example,
+library, or named integration test is eligible, and arguments after `--` cannot
+enable that build-only optimization. Combined or implicit target sets remain
+Cargo-owned.
+
+For standard `test --lib`, including an exact package selection from a workspace
+root, the first successful command remains fully Cargo-owned. Cinder injects an
+inline target runner only after rejecting every project or environment runner.
+Cargo still selects and builds the test target, sets its working directory and
+runtime environment, and invokes the runner. Cargo's artifact receipt identifies
+the selected manifest directory; the runner requires its observed working
+directory to match that canonical package directory and rejects a nonstandard
+library harness before publishing state. On a later exact-state hit, Cinder
+holds Cargo's target lock, repeats the full artifact/source/input/output
+validation above, re-resolves the recorded package directory without following
+a replacement symlink, verifies that the recorded path still matches its
+publication-time digest, and requires its canonical `Cargo.toml` to remain an
+exact entry in Cargo's unchanged receipt-backed input graph. It then applies
+the current arguments after `--` and executes the recorded harness with Cargo's
+captured runtime library environment. A failure is returned as status 101 and
+is never retried. This removes Cargo orchestration, not test execution.
 
 Cargo sometimes translates rustc dep-info into a versioned binary file in a
 fingerprint directory whose unit hash differs from the `.d` output, notably
@@ -180,6 +246,12 @@ for multi-crate-type libraries. Cinder parses only Cargo's documented version
 missing, or ambiguous encodings disable reuse. This keeps volatile shell `_`
 out of ordinary contexts while still invalidating units that compile with
 `env!("_")`.
+
+Some multi-crate-type packages, including Handy's staticlib/cdylib/rlib target,
+publish an unhashed dependency file beside several unhashed public libraries.
+Cinder accepts that layout only when the hash-indexed dep-info is absent, the
+descriptor yields one exact Cargo unit name, and the dependency file itself
+names the real compiler outputs. Ambiguous unhashed output sets stay with Cargo.
 
 Direct `cinder run` invocations launch a patched artifact immediately. A Cargo
 shim commonly sits beneath a file watcher, where one atomic editor save may be
@@ -202,10 +274,11 @@ contain:
   the raw environment values;
 - content digests plus a validated list and snapshot of project Rust sources;
 - reference artifact filesystem identity and publication-time content digest;
-- Cargo dep-info, manifest, lockfile, configuration, project Rust, and
+- Cargo dep-info, manifest, lockfile, configuration, consumed Rust source, and
   build-script input full filesystem identities and content digests;
 - Cargo's exact hashed artifact, dep-info, and fingerprint paths;
-- Cargo's platform runtime dynamic-library path for fast `run` launches;
+- Cargo's platform runtime dynamic-library path for fast `run` and selected
+  library-test launches;
 - a precomputed index of unique eligible string data.
 
 After Cargo succeeds, source capture and indexing run outside the command's
@@ -215,17 +288,148 @@ publication, and abandons state if a rapid subsequent save races recording.
 Patched states are derived from the previous proven snapshot plus the exact
 accepted source edit, rather than rereading potentially newer live source.
 
-Build-script packages require a compiler receipt before acceleration. Cinder
-records explicit `rerun-if-changed` paths, recursively fingerprints watched
-directories, and models Cargo's default rule by fingerprinting the package
-tree when the script emits no file watches. Cargo target and Git metadata are
-excluded from that default tree. Cinder content-hashes inputs whose full
-filesystem identity changed, treats the build-relevant environment as
-context, excludes generated target files from the source identity, and
-invalidates on other project Rust or manifest changes. An unreadable,
-oversized, or ambiguous build-script input disables the optimization.
+Build-script packages require exact Cargo artifact and output-directory
+receipts before acceleration. Cinder retains Cargo's complete active
+build-script graph, not only the selected package's script, and records every
+script's explicit `rerun-if-changed` paths. It recursively fingerprints watched
+directories and models Cargo's default rule by fingerprinting that script's
+package tree when the script emits no file watches. Cargo target and Git
+metadata are excluded from that default tree. Cinder content-hashes inputs
+whose full filesystem identity changed, treats the build-relevant environment
+as context, excludes generated target files from the source identity, and
+invalidates on consumed Rust or manifest changes. A transitive build script's
+receipt is not mistaken for a selected-package `OUT_DIR`: the selected package
+must provide that directory only when its own manifest declares a build script,
+while all transitive receipt directories must still exactly match Cargo's
+fingerprint graph. A missing mapping or an unreadable, oversized, or ambiguous
+build-script input disables the optimization.
+
+Project topology separately records Rust/Cargo path names and directory
+identities so a new auto target, manifest, build script, or configuration file
+cannot hide behind unchanged compiler dep-info. Existing unrelated Rust file
+contents are not treated as compiler inputs merely because they share a large
+workspace; Cargo dep-info remains authoritative for content dependencies.
+Each recorded directory also carries a digest of the relevant Rust/Cargo path
+names below it. When an editor atomically replaces one source file, Cinder
+rechecks only the smallest changed recorded subtree and accepts it only when
+that path-name digest is unchanged. A missing subtree digest, an unreadable
+local scan, or old-format state falls back to the full project digest; an added
+or removed Rust/Cargo path invalidates immediately. Parent-first ordering avoids
+rescanning descendants already covered by a changed ancestor.
+Ancestor directories outside the project use a separate digest containing only
+Cargo-discoverable manifest, lockfile, toolchain, and configuration names. An
+unrelated sibling created in a shared temporary directory therefore requires
+only a constant-size control check, while a new ancestor `.cargo/config.toml`
+still invalidates the state. External control checks never suppress the stricter
+project-subtree validation even when the ancestor is a path prefix.
+Internal directory symlinks are traversed once by canonical target, while their
+logical aliases remain explicit inputs. Cycles are bounded, removal or retarget
+invalidates, and any directory symlink escaping the workspace/package fails
+closed. This supports Bun's tracked `src/cli -> runtime/cli` layout without
+allowing an alias to bypass topology validation.
+
 Malformed, missing, stale, ambiguous, or version-mismatched state is always a
 Cargo miss.
+
+## Local evidence boundary
+
+When `CINDER_USAGE=1` is explicitly enabled, Cinder appends a fixed-size local
+record after each `run`, `build`, `check`, or selected `test` acceleration
+decision. Records contain a command enum, outcome enum, bounded decision time,
+and day number. They contain no repository identifier, path, arguments, source,
+environment values, artifact name, or Cargo output. The evidence file lives in
+the user's state directory, is owner-only, is bounded to 16 MiB, and ignores
+malformed or partial records.
+Recording failures never change command success or prevent Cargo fallback.
+
+The control variable is excluded from Cinder's build-context identity and is
+removed before Cargo, rustc, build scripts, and launched artifacts can observe
+it. This makes evidence collection a property of Cinder itself rather than an
+input to the program being built. Default execution remains free of evidence
+I/O; enabled overhead is measured separately from fast-path decision time.
+
+The same boundary applies to Cinder's explicitly enumerated implementation
+controls, including Cargo selection, tracing, synchronous test recording,
+fast-path disabling, receipt transport, and legacy wrapper handoff. They do not
+participate in context identity and are removed from Cargo, rustc, build-script,
+and launched-program environments. Unknown `CINDER_*` variables are not treated
+as controls: they remain ordinary user environment and continue to invalidate
+state, so Cinder cannot silently hide a project's own variable by prefix alone.
+
+## Experimental first-seen check replay
+
+When `CINDER_EXPERIMENTAL_DIRECT_CHECK=1` is set, Cinder captures the exact
+compiler executable, arguments, and working directory for a successfully
+validated selected unit by observing the direct children of the Cargo process
+that Cinder started. It does not change Cargo's command, compiler command, or
+the environment visible to rustc and build scripts. Cargo-generated values that
+the selected unit actually read are restored from rustc's dep-info; `OUT_DIR`
+comes from Cargo's build-script message. User environment remains inherited
+from Cinder and is already included in the command-context identity. Neither
+recipe persistence nor re-execution occurs by default.
+
+On macOS, the executable stored in the recipe comes from the same
+`KERN_PROCARGS2` snapshot as the argument vector. This preserves the invoked
+`rustc` path even when rustup uses proxy hard links and `proc_pidpath` reports a
+different link name such as `cargo`. Independent before/after process-path
+reads reject a process that exited or changed executable while it was being
+observed; stale recipe formats are invalidated rather than replayed.
+
+The restoration allowlist includes Cargo's documented crate variables,
+including `CARGO_TARGET_TMPDIR` for integration-test and benchmark units, plus
+Cargo's platform dynamic-library path when rustc recorded it as a source
+dependency. Any other environment dependency must exactly match the value
+inherited by Cinder (including absence), or recipe publication is rejected.
+Recipe format changes invalidate older captures.
+
+Compiler arguments are not the complete compiler input when procedural macros
+are involved. A stable procedural macro can call `std::env::var` while expanding
+the selected crate, including for values Cargo adds only to the compiler
+environment, without causing rustc to list that access in dep-info. The macOS
+`KERN_PROCARGS2` string area contains `argv`, `envp`, and Apple's auxiliary
+process strings. `argc` provides an exact boundary for arguments, but there is
+no equivalent environment count that lets Cinder prove where `envp` ends and
+the auxiliary vector begins. Cinder therefore stops reading at `argc` and does
+not use the remaining process-string tail as environment evidence.
+
+To close the ordinary-macro gap without storing arbitrary environment data,
+Cinder records per-recipe salted fingerprints of every present and absent
+environment dependency in Cargo's previous rustc dep-info. After rustc
+succeeds, each `env!` or `option_env!` access in the new dep-info must match a
+prior fingerprint. A newly introduced access or changed value rejects the
+replay and lets Cargo establish a new baseline; a later equivalent edit may
+then qualify. The fingerprints contain neither raw keys nor raw values and are
+format-bound so older recipes cannot bypass the check.
+Consequently, any `proc-macro` unit in Cargo's message stream disables recipe
+publication for the entire command. Cargo emits artifact messages for fresh
+units as well, and repeated-edit tests enforce that this guard remains active
+after the macro dependency is already built. A missing or malformed target-kind
+field also fails closed. Reconstructing likely Cargo variables is deliberately
+not treated as parity.
+
+The macOS process-inspection interfaces used by the observer are best-effort
+and subject to operating-system change. Observation failure, an incomplete
+process record, an unmatched artifact, or any unsupported platform simply
+omits the recipe. It never weakens the normal Cargo fallback.
+
+The experimental path is narrower than ordinary check reuse. It requires the
+same compiler context, available exact Cargo outputs, unchanged non-source
+inputs and source topology, Cargo's target lock, and a selected package without
+an `OUT_DIR` from its own build script or a procedural macro anywhere in the
+active graph. The replay runs the exact compiler recipe against the same Cargo
+target outputs. Cinder accepts only a successful compiler process whose output
+consists exclusively of rustc's internal artifact notifications. Warnings,
+errors, malformed output, source-set changes, state publication failures, and
+every ambiguous case are discarded and rerun through Cargo so Cargo remains
+responsible for user-facing diagnostics.
+
+Successful replay publishes new Cinder validation state but deliberately does
+not fabricate or update Cargo fingerprints. A later real Cargo command can
+therefore rebuild conservatively. The experimental control variable is excluded
+from Cinder's context identity and removed before Cargo or rustc can observe it.
+This path remains opt-in until realistic cross-project, build-script,
+diagnostic, concurrency, and artifact-parity evidence is broad enough for a
+default Cargo-compatibility claim.
 
 Public dep-info also lets the same mechanism work from a virtual workspace
 root with `-p`; generated target files and build scripts remain ordinary
@@ -235,12 +439,16 @@ Integration tests compare transformed ordinary and `format!` strings with a
 normal Cargo build; cover standalone packages, virtual workspaces, linked
 library targets, static libraries, structural revision restoration,
 build-script content, new target/config topology, toolchain identity,
-partial/full Cargo clean behavior, compiler-wrapper chaining, target locking,
+partial/full Cargo clean behavior, compiler-wrapper fallback, target locking,
 cache pruning, global-option and built-in alias routing, Cargo shim recursion,
 selected check/test invalidation, encoded Cargo dep-info, and Cargo freshness
-after an in-place build patch. Real-project validation additionally checks code
-signatures for executables and exact revision digests/archive readability for
-library artifacts.
+after an in-place build patch. Cargo-message coverage also verifies human
+warnings/errors, build-script environment isolation, static libraries,
+test-harness output layouts, transactional rejection of unknown artifact
+layouts, workspace-wrapper and nested-manifest fallback, asynchronous
+recording, and JSON-shaped program output after build completion. Real-project
+validation additionally checks code signatures for executables and exact
+revision digests/archive readability for library artifacts.
 
 Revision history retains at most eight entries per project and command kind.
 A global collector enforces a 4 GiB logical-byte budget across complete cache
@@ -258,7 +466,7 @@ no longer live.
 ## Deliberate non-goals for this milestone
 
 Cinder does not replace release builds, dependency management, distributed
-builds, remote caches, non-Apple targets, or general first-seen Rust code
-generation. It does not claim arbitrary new source edits can be transformed
-safely. Expanding the eligible set requires a correctness proof and end-to-end
-benchmark, while the Cargo fallback remains the compatibility floor.
+builds, remote caches, non-Apple artifact acceleration, or general first-seen
+Rust code generation. It does not claim arbitrary new source edits can be
+transformed safely. Expanding the eligible set requires a correctness proof and
+end-to-end benchmark, while the Cargo fallback remains the compatibility floor.
