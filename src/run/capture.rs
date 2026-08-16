@@ -173,17 +173,19 @@ pub fn cargo_arguments(
         let cinder = env::current_exe()
             .and_then(fs::canonicalize)
             .map_err(|error| format!("could not identify the Cinder executable: {error}"))?;
+        // The runner runs with Cinder's control variables scrubbed from
+        // Cargo's environment, so the recording mode travels as an argument.
+        let recording_mode = if env::var_os(super::SYNCHRONOUS_STATE_RECORDING).is_some() {
+            "sync"
+        } else {
+            "async"
+        };
         let runner = if runner_command == "__run-test-artifact" {
             let project = fs::canonicalize(
                 env::current_dir()
                     .map_err(|error| format!("could not inspect current directory: {error}"))?,
             )
             .map_err(|error| format!("could not resolve current directory: {error}"))?;
-            let recording_mode = if env::var_os(super::SYNCHRONOUS_STATE_RECORDING).is_some() {
-                "sync"
-            } else {
-                "async"
-            };
             format!(
                 "target.{target}.runner=[{},{},{},{},{},{}]",
                 toml_string(cinder.as_os_str())?,
@@ -195,11 +197,12 @@ pub fn cargo_arguments(
             )
         } else {
             format!(
-                "target.{target}.runner=[{},{},{},{}]",
+                "target.{target}.runner=[{},{},{},{},{}]",
                 toml_string(cinder.as_os_str())?,
                 toml_string(OsStr::new(runner_command))?,
                 toml_string(context_path.as_os_str())?,
                 toml_string(receipt_directory.as_os_str())?,
+                toml_string(OsStr::new(recording_mode))?,
             )
         };
         insert_cargo_config(&mut arguments, runner)?;

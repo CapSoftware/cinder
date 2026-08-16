@@ -915,11 +915,19 @@ fn restore_cached_build_artifact(directory: &Path, historical: &State) -> Result
 }
 
 pub fn run_artifact(mut arguments: Vec<OsString>) -> Result<u8, String> {
-    if arguments.len() < 3 {
-        return Err("artifact runner requires context, receipts, and executable paths".to_owned());
+    if arguments.len() < 4 {
+        return Err(
+            "artifact runner requires context, receipts, recording mode, and executable paths"
+                .to_owned(),
+        );
     }
     let context_path = PathBuf::from(arguments.remove(0));
     let receipt_directory = PathBuf::from(arguments.remove(0));
+    let synchronous_recording = match arguments.remove(0).to_str() {
+        Some("sync") => true,
+        Some("async") => false,
+        _ => return Err("artifact runner received an invalid recording mode".to_owned()),
+    };
     messages::wait_for_runner_receipts(&receipt_directory)?;
     let artifact = absolute_path(Path::new(&arguments.remove(0)))?;
     let program_name = artifact
@@ -941,6 +949,7 @@ pub fn run_artifact(mut arguments: Vec<OsString>) -> Result<u8, String> {
             &program_name,
             &run_context,
             Some(receipt_directory),
+            synchronous_recording,
         )
     }) {
         eprintln!("cinder: could not prepare the next fast run: {error}");
