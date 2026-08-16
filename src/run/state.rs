@@ -393,6 +393,21 @@ impl State {
         directory: &Path,
         kind: StateKind,
     ) -> Result<Option<StateLockProbe>, String> {
+        match Self::load_lock_probe_components(directory, kind) {
+            Ok(probe) => Ok(probe),
+            Err(reason) => {
+                if env::var_os(super::TRACE_RUN).is_some() {
+                    eprintln!("    Cinder trace: unreadable state probe is a miss ({reason})");
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    fn load_lock_probe_components(
+        directory: &Path,
+        kind: StateKind,
+    ) -> Result<Option<StateLockProbe>, String> {
         let root = state_directory(directory, kind);
         let artifact = match fs::read(root.join("artifact")) {
             Ok(value) => PathBuf::from(OsString::from_vec(value)),
@@ -431,7 +446,22 @@ impl State {
         }))
     }
 
+    /// Malformed, truncated, or version-mismatched state is always an
+    /// ordinary Cargo miss, never a user-visible fast-path error. The reason
+    /// is traced so an unexpected recurring miss stays diagnosable.
     pub(super) fn load_from(root: &Path) -> Result<Option<Self>, String> {
+        match Self::load_from_components(root) {
+            Ok(state) => Ok(state),
+            Err(reason) => {
+                if env::var_os(super::TRACE_RUN).is_some() {
+                    eprintln!("    Cinder trace: unreadable state is a miss ({reason})");
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    fn load_from_components(root: &Path) -> Result<Option<Self>, String> {
         let artifact_bytes = match fs::read(root.join("artifact")) {
             Ok(value) => value,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
