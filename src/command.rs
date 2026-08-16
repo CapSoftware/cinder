@@ -219,6 +219,11 @@ fn run_cargo_inner(
             crate::run::clear_project_state(&arguments).unwrap_or_else(|error| {
                 eprintln!("cinder: Cargo cleaned successfully, but Cinder state remains: {error}");
             });
+            crate::run::clear_unit_cache().unwrap_or_else(|error| {
+                eprintln!(
+                    "cinder: Cargo cleaned successfully, but the unit cache remains: {error}"
+                );
+            });
             crate::run::clear_environment_witnesses().unwrap_or_else(|error| {
                 eprintln!(
                     "cinder: Cargo cleaned successfully, but environment witnesses remain: {error}"
