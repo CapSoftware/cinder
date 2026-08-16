@@ -208,6 +208,11 @@ fn run_cargo_inner(
             crate::run::clear_project_state(&arguments).unwrap_or_else(|error| {
                 eprintln!("cinder: Cargo cleaned successfully, but Cinder state remains: {error}");
             });
+            crate::run::clear_environment_witnesses().unwrap_or_else(|error| {
+                eprintln!(
+                    "cinder: Cargo cleaned successfully, but environment witnesses remain: {error}"
+                );
+            });
             if let Ok(directory) = env::current_dir() {
                 crate::toolchain::clean_project(&directory);
             }
