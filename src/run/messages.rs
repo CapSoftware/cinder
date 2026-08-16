@@ -19,6 +19,7 @@ use std::{
 
 const CAPTURE_ENABLED: &str = "cargo-message-capture";
 const CAPTURE_READY: &str = "cargo-messages-ready";
+const RECEIPT_GAPS: &str = "receipt-gaps";
 const PACKAGE_CACHE_MAGIC: &[u8] = b"CINDER-PACKAGE-ID-1\n";
 const MAX_PACKAGE_CACHE_BYTES: u64 = 1_048_576;
 const MAX_PACKAGE_MANIFEST_BYTES: u64 = 4 * 1_048_576;
@@ -714,14 +715,19 @@ impl<'a> MessageCapture<'a> {
         true
     }
 
-    fn selected_out_directory(&self) -> Result<Option<&Path>, String> {
-        let Some(selected_package_id) = self.selected_package_id.as_deref() else {
-            return Ok(None);
-        };
+    /// Resolves the build-script output directory for one selected artifact
+    /// message by its package ID. Multi-package workspace captures need this
+    /// per receipt; a single-package capture resolves the same value for every
+    /// receipt, matching the previous selected-package behavior exactly.
+    fn receipt_out_directory(&self, message: &serde_json::Value) -> Result<Option<&Path>, String> {
+        let package_id = message
+            .get("package_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "Cargo artifact has no package ID".to_owned())?;
         let mut matching = self
             .build_scripts
             .iter()
-            .filter(|(package_id, _)| package_id == selected_package_id)
+            .filter(|(script_package_id, _)| script_package_id == package_id)
             .map(|(_, out_directory)| out_directory.as_path());
         let Some(first) = matching.next() else {
             return Ok(None);
@@ -769,16 +775,12 @@ impl<'a> MessageCapture<'a> {
             return;
         }
         self.finished = true;
-        let out_directory = self.selected_out_directory();
         if env::var_os(super::TRACE_RUN).is_some() {
             eprintln!(
-                "    Cinder trace: Cargo messages selected-artifacts={} build-scripts={} out-directory={} disabled={}",
+                "    Cinder trace: Cargo messages selected-artifacts={} build-scripts={} disabled={}",
                 self.artifacts.len(),
                 self.build_scripts.len(),
-                out_directory
-                    .as_ref()
-                    .is_ok_and(|out_directory| out_directory.is_some()),
-                self.disabled || out_directory.is_err(),
+                self.disabled,
             );
         }
         if self.artifacts.is_empty() {
@@ -787,7 +789,7 @@ impl<'a> MessageCapture<'a> {
             }
         }
         if !self.disabled {
-            match out_directory.and_then(|out_directory| self.publish_receipts(out_directory)) {
+            match self.publish_receipts() {
                 Ok(()) => {}
                 Err(error) if env::var_os(super::TRACE_RUN).is_some() => {
                     eprintln!("    Cinder trace: ignored Cargo artifact messages ({error})");
@@ -802,24 +804,51 @@ impl<'a> MessageCapture<'a> {
     /// An unknown output layout must disable the whole optimization candidate;
     /// accepting a parseable subset could make a multi-unit command appear to
     /// have built only one unit.
-    fn publish_receipts(&self, out_directory: Option<&Path>) -> Result<(), String> {
+    fn publish_receipts(&self) -> Result<(), String> {
+        // A workspace member reached through a directory symlink has a
+        // literal manifest path under the root but a canonical path outside
+        // it, so the canonical-root matcher silently drops its units. Any
+        // such manifest disables workspace capture entirely.
+        if let Some(root) = self.workspace_root {
+            for manifest in self.package_manifests.values() {
+                if manifest.starts_with(root)
+                    && !fs::canonicalize(manifest)
+                        .map_err(|error| {
+                            format!(
+                                "could not resolve Cargo package manifest {}: {error}",
+                                manifest.display()
+                            )
+                        })?
+                        .starts_with(root)
+                {
+                    return Err(format!(
+                        "workspace package {} escapes the workspace root",
+                        manifest.display()
+                    ));
+                }
+            }
+        }
         let build_script_outputs = self.build_script_outputs()?;
         let package_manifests = self.package_manifest_paths();
-        let mut receipts = self
-            .artifacts
-            .iter()
-            .map(|artifact| {
-                cargo_artifact_receipt(
-                    artifact,
-                    out_directory,
-                    &package_manifests,
-                    &build_script_outputs,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
+        // A selected unit that converts to no receipt for any reason other
+        // than being a build script is a gap: a later multi-root recording
+        // that silently omitted it could reuse state while that unit fails.
+        // The gap count is staged beside the receipts so the recorder can
+        // refuse under-validated root sets.
+        let mut receipt_gaps = 0usize;
+        let mut receipts = Vec::new();
+        for artifact in &self.artifacts {
+            match cargo_artifact_receipt(
+                artifact,
+                self.receipt_out_directory(artifact)?,
+                &package_manifests,
+                &build_script_outputs,
+            )? {
+                Some(receipt) => receipts.push(receipt),
+                None if artifact_is_build_script(artifact) => {}
+                None => receipt_gaps += 1,
+            }
+        }
         if !self.compiler_replay_blocked {
             for receipt in &mut receipts {
                 let mut matching = self.compiler_recipes.iter().filter(|recipe| {
@@ -863,6 +892,11 @@ impl<'a> MessageCapture<'a> {
             })
             .collect::<Vec<_>>();
         let publish = (|| {
+            fs::write(
+                self.receipt_directory.join(RECEIPT_GAPS),
+                receipt_gaps.to_string(),
+            )
+            .map_err(|error| format!("could not stage the Cargo receipt gap count: {error}"))?;
             for (receipt, (pending, _, recipe_pending, _)) in receipts.iter().zip(&paths) {
                 write_artifact_receipt(pending, receipt)?;
                 if let Some(recipe) = receipt.compiler_recipe.as_ref() {
@@ -884,6 +918,7 @@ impl<'a> MessageCapture<'a> {
             Ok(())
         })();
         if publish.is_err() {
+            let _ = fs::remove_file(self.receipt_directory.join(RECEIPT_GAPS));
             for (pending, published, recipe_pending, recipe_published) in paths {
                 let _ = fs::remove_file(pending);
                 let _ = fs::remove_file(published);
@@ -893,6 +928,29 @@ impl<'a> MessageCapture<'a> {
         }
         publish
     }
+}
+
+/// Reads the staged receipt gap count. A missing or malformed marker means
+/// the receipt set cannot be proven complete and the caller must refuse.
+pub(super) fn read_receipt_gaps(receipt_directory: &Path) -> Option<usize> {
+    let contents = fs::read_to_string(receipt_directory.join(RECEIPT_GAPS)).ok()?;
+    let contents = contents.trim();
+    if contents.is_empty() || contents.len() > 6 || !contents.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    contents.parse().ok()
+}
+
+fn artifact_is_build_script(message: &serde_json::Value) -> bool {
+    message
+        .get("target")
+        .and_then(|target| target.get("kind"))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|kinds| {
+            kinds
+                .iter()
+                .any(|kind| kind.as_str() == Some("custom-build"))
+        })
 }
 
 fn cargo_artifact_receipt(
