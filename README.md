@@ -56,6 +56,34 @@ changes, unsupported command shapes, ambiguous artifacts, stale state, custom
 runners, nonstandard harnesses, release builds, and failed validation stay with
 Cargo.
 
+## The tuned development toolchain
+
+For compilation Cinder cannot skip, it can make the compiler itself faster.
+When a `cinder-tuned` toolchain is present — the same rustc release source as
+the active stable, rebuilt with ThinLTO, one codegen unit, and profile-guided
+optimization, with the parallel frontend enabled at run time — eligible
+development `build`/`check`/`test`/`run` commands route through it
+automatically. Measured out of the box against plain Cargo, fresh builds were
+12% faster on ripgrep, 29% faster on Cinder's own crate, and 4% faster on fd,
+with every artifact kept in a separate `target/cinder-tuned` namespace so
+tuned and stock outputs can never mix.
+
+Pinned projects can have their own matched build: a project pinning rustc X
+routes through `cinder-tuned-X` when that build exists and proves the same
+version identity, with knobs qualified per toolchain. Cap's pinned 1.88,
+rebuilt from its own release source with Cap-trained PGO, measured 4–6%
+faster cold member builds than the stock pin (16% in the best paired run),
+edits flat to 6% better, on top of 15–21x no-change reuse — with Cap member
+test suites passing identically.
+
+Development artifacts from the tuned toolchain are functionally equivalent
+but not byte-identical to stock Cargo's; release builds always use the stock
+toolchain unchanged. A project toolchain pin without a matching tuned build,
+an explicit toolchain choice, a user-set target directory, or any tuned-path
+failure returns the command to stock Cargo automatically. Full per-knob
+attribution, correctness gates, and retained negative results are in the
+[tuned toolchain report](benchmarks/tuned-toolchain/README.md).
+
 ## Results
 
 These are median end-to-end timings from real repositories on Apple Silicon.
