@@ -198,6 +198,9 @@ fn run_cargo_inner(
             crate::run::clear_project_state(&arguments).unwrap_or_else(|error| {
                 eprintln!("cinder: Cargo cleaned successfully, but Cinder state remains: {error}");
             });
+            if let Ok(directory) = env::current_dir() {
+                crate::toolchain::clean_project(&directory);
+            }
         }
         return Ok(exit_code(status));
     }
