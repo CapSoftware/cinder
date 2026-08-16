@@ -25,8 +25,11 @@ use std::{
 // Cinder could have persisted a recipe without a proof required by the current
 // replay policy. Version 6 adds privacy-safe fingerprints of Cargo's previous
 // rustc environment dependencies so newly introduced or changed accesses can
-// be rejected after compilation without persisting arbitrary values.
-const RECIPE_MAGIC: &[u8; 8] = b"CNDRCP06";
+// be rejected after compilation without persisting arbitrary values. Version 7
+// records whether the environment is the tracked `# env-dep:` subset or the
+// complete witness-verified set Cargo injected, which is what makes untracked
+// procedural-macro environment reads observe Cargo-identical values.
+const RECIPE_MAGIC: &[u8; 8] = b"CNDRCP07";
 const MAX_VALUES: usize = 16_384;
 const MAX_VALUE_BYTES: usize = 1024 * 1024;
 const MAX_DIAGNOSTIC_BYTES: u64 = 1024 * 1024;
@@ -47,6 +50,33 @@ const FIXED_CARGO_COMPILER_ENVIRONMENT: [&str; 12] = [
     "LIBPATH",
     "OUT_DIR",
 ];
+/// Launch-layer constants injected between Cinder and the compiler: the
+/// rustup proxy's toolchain variables plus CoreFoundation's user text
+/// encoding, which Cargo's process self-corrects and children inherit. A
+/// witness-verified recipe restores them explicitly; the session jobserver
+/// variable is deliberately never restored (its file descriptors are only
+/// live inside Cargo's own process tree).
+pub(super) const WITNESS_CONSTANT_ENVIRONMENT: [&str; 6] = [
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "RUSTUP_TOOLCHAIN",
+    "RUSTUP_TOOLCHAIN_SOURCE",
+    "RUST_RECURSION_COUNT",
+    "__CF_USER_TEXT_ENCODING",
+];
+pub(super) const JOBSERVER_ENVIRONMENT: &str = "CARGO_MAKEFLAGS";
+
+/// How a recipe's environment was established.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum EnvironmentKind {
+    /// Only values rustc provably read (`# env-dep:`), reconstructed from
+    /// the dependency file. Sufficient when no procedural macro can make an
+    /// untracked read during the replayed compilation.
+    Tracked,
+    /// The complete injected set Cargo was observed to pass, validated
+    /// variable-by-variable against the per-toolchain environment witness.
+    FullWitnessed,
+}
 
 #[derive(Clone)]
 pub(super) struct CompilerRecipe {
@@ -54,6 +84,10 @@ pub(super) struct CompilerRecipe {
     pub(super) working_directory: PathBuf,
     pub(super) arguments: Vec<OsString>,
     pub(super) environment: Vec<(OsString, OsString)>,
+    pub(super) environment_kind: EnvironmentKind,
+    /// The raw environment the compiler process was observed with, kept only
+    /// in memory for witness validation at binding time; never persisted.
+    pub(super) observed_environment: Option<Vec<(OsString, OsString)>>,
     environment_fingerprint_salt: [u8; 32],
     dependency_environment_absences: Vec<[u8; 32]>,
     dependency_environment_values: Vec<[u8; 32]>,
@@ -65,6 +99,7 @@ impl CompilerRecipe {
         executable: PathBuf,
         working_directory: PathBuf,
         arguments: Vec<OsString>,
+        observed_environment: Option<Vec<(OsString, OsString)>>,
     ) -> Option<Self> {
         if !executable.is_absolute()
             || !working_directory.is_absolute()
@@ -86,6 +121,8 @@ impl CompilerRecipe {
             working_directory,
             arguments,
             environment: Vec::new(),
+            environment_kind: EnvironmentKind::Tracked,
+            observed_environment,
             environment_fingerprint_salt: environment_fingerprint_salt()?,
             dependency_environment_absences: Vec::new(),
             dependency_environment_values: Vec::new(),
@@ -357,6 +394,11 @@ fn cargo_compiler_environment(key: &OsStr) -> bool {
     })
 }
 
+pub(super) fn witness_constant_environment(key: &OsStr) -> bool {
+    key.to_str()
+        .is_some_and(|key| WITNESS_CONSTANT_ENVIRONMENT.contains(&key))
+}
+
 fn inherited_environment_matches(key: &OsStr, value: Option<&[u8]>) -> bool {
     if key.is_empty() || key.as_bytes().contains(&0) || key.as_bytes().contains(&b'=') {
         return false;
@@ -372,6 +414,12 @@ pub(super) fn write_compiler_recipe(path: &Path, recipe: &CompilerRecipe) -> Res
     let mut file = fs::File::create(path)
         .map_err(|error| format!("could not create compiler recipe: {error}"))?;
     file.write_all(RECIPE_MAGIC)
+        .map_err(|error| format!("could not write compiler recipe: {error}"))?;
+    let kind = match recipe.environment_kind {
+        EnvironmentKind::Tracked => 0_u8,
+        EnvironmentKind::FullWitnessed => 1_u8,
+    };
+    file.write_all(&[kind])
         .map_err(|error| format!("could not write compiler recipe: {error}"))?;
     write_value(&mut file, recipe.executable.as_os_str())?;
     write_value(&mut file, recipe.working_directory.as_os_str())?;
@@ -400,6 +448,14 @@ pub(super) fn read_compiler_recipe(path: &Path) -> Result<CompilerRecipe, String
     if &magic != RECIPE_MAGIC {
         return Err("compiler recipe has an unsupported format".to_owned());
     }
+    let mut kind = [0_u8; 1];
+    file.read_exact(&mut kind)
+        .map_err(|error| format!("could not read compiler recipe: {error}"))?;
+    let environment_kind = match kind[0] {
+        0 => EnvironmentKind::Tracked,
+        1 => EnvironmentKind::FullWitnessed,
+        _ => return Err("compiler recipe has an unsupported environment kind".to_owned()),
+    };
     let executable = PathBuf::from(read_value(&mut file)?);
     let working_directory = PathBuf::from(read_value(&mut file)?);
     if !executable.is_absolute() || !working_directory.is_absolute() {
@@ -415,7 +471,10 @@ pub(super) fn read_compiler_recipe(path: &Path) -> Result<CompilerRecipe, String
     let mut environment_keys = BTreeSet::new();
     for _ in 0..environment_count {
         let key = read_value(&mut file)?;
-        if !cargo_compiler_environment(&key) || !environment_keys.insert(key.clone()) {
+        let admissible = cargo_compiler_environment(&key)
+            || (environment_kind == EnvironmentKind::FullWitnessed
+                && (witness_constant_environment(&key) || key == "PATH"));
+        if !admissible || !environment_keys.insert(key.clone()) {
             return Err(
                 "compiler recipe contains an unsupported or duplicate environment key".to_owned(),
             );
@@ -439,6 +498,8 @@ pub(super) fn read_compiler_recipe(path: &Path) -> Result<CompilerRecipe, String
         working_directory,
         arguments,
         environment,
+        environment_kind,
+        observed_environment: None,
         environment_fingerprint_salt,
         dependency_environment_absences,
         dependency_environment_values,
@@ -567,6 +628,17 @@ pub(super) fn replay_compiler(
         }) {
             command.env_remove(key);
         }
+        if recipe.environment_kind == EnvironmentKind::FullWitnessed {
+            // Constants the recipe recorded as injected are restored by the
+            // recipe environment below; constants that were inherited at
+            // record time are still inherited now because the bound context
+            // requires an identical environment. Only the jobserver is
+            // scrubbed and never restored — Cargo overrides any outer value
+            // with descriptors that are only live inside its own process
+            // tree, so no inheritable value can match what the recorded
+            // compiler actually saw.
+            command.env_remove(JOBSERVER_ENVIRONMENT);
+        }
         command.envs(
             recipe
                 .environment
@@ -671,6 +743,7 @@ mod tests {
             PathBuf::from("/toolchain/bin/rustc"),
             PathBuf::from("/workspace"),
             arguments,
+            None,
         )
         .unwrap();
         assert!(recipe.environment.is_empty());
@@ -757,6 +830,8 @@ mod tests {
             .map(OsString::from)
             .into(),
             environment: vec![(OsString::from("CARGO_CRATE_NAME"), OsString::from("app"))],
+            environment_kind: EnvironmentKind::Tracked,
+            observed_environment: None,
             environment_fingerprint_salt: [1; 32],
             dependency_environment_absences: Vec::new(),
             dependency_environment_values: Vec::new(),
@@ -812,6 +887,8 @@ mod tests {
             working_directory: PathBuf::from("/workspace"),
             arguments: vec![OsString::from("--crate-name"), OsString::from("app")],
             environment: Vec::new(),
+            environment_kind: EnvironmentKind::Tracked,
+            observed_environment: None,
             environment_fingerprint_salt: [1; 32],
             dependency_environment_absences: Vec::new(),
             dependency_environment_values: Vec::new(),
@@ -867,6 +944,8 @@ mod tests {
             working_directory: PathBuf::from("/workspace"),
             arguments: vec![OsString::from("--crate-name"), OsString::from("app")],
             environment: Vec::new(),
+            environment_kind: EnvironmentKind::Tracked,
+            observed_environment: None,
             environment_fingerprint_salt: [1; 32],
             dependency_environment_absences: Vec::new(),
             dependency_environment_values: Vec::new(),
@@ -908,6 +987,8 @@ mod tests {
             working_directory: PathBuf::from("/workspace"),
             arguments: vec![OsString::from("--crate-name"), OsString::from("app")],
             environment: Vec::new(),
+            environment_kind: EnvironmentKind::Tracked,
+            observed_environment: None,
             environment_fingerprint_salt: [1; 32],
             dependency_environment_absences: Vec::new(),
             dependency_environment_values: Vec::new(),
@@ -942,6 +1023,8 @@ mod tests {
             working_directory: PathBuf::from("/workspace"),
             arguments: vec![OsString::from("--crate-name"), OsString::from("app")],
             environment: Vec::new(),
+            environment_kind: EnvironmentKind::Tracked,
+            observed_environment: None,
             environment_fingerprint_salt: [1; 32],
             dependency_environment_absences: Vec::new(),
             dependency_environment_values: Vec::new(),
@@ -987,6 +1070,8 @@ mod tests {
             working_directory: PathBuf::from("/workspace"),
             arguments: vec![OsString::from("--crate-name"), OsString::from("app")],
             environment: Vec::new(),
+            environment_kind: EnvironmentKind::Tracked,
+            observed_environment: None,
             environment_fingerprint_salt: [1; 32],
             dependency_environment_absences: Vec::new(),
             dependency_environment_values: Vec::new(),
