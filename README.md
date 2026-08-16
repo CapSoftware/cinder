@@ -38,11 +38,18 @@ acceleration.
 On a proven Cargo baseline, Cinder can:
 
 - reuse an unchanged selected `build`, `check`, or `test --no-run` result;
+- reuse an unchanged plain `check` or `build` of a multi-target package, and an
+  unchanged plain `check` from a workspace root, validating every recorded
+  member target;
 - run the exact validated Cargo-built standard library test harness directly;
 - restore one of the last eight validated source revisions for selected builds
   and runs;
 - patch one unambiguous equal-length Rust string in a development executable on
   macOS, then sign and publish the result atomically.
+
+Every reuse hit also replays the cached compiler warnings and manifest
+diagnostics that a real no-change Cargo command would print, byte-for-byte;
+a state whose replay cannot be proven is not published.
 
 Test bodies still execute on every test invocation. First-seen structural
 changes, unsupported command shapes, ambiguous artifacts, stale state, custom
@@ -64,13 +71,17 @@ all seven tests in every sample.
 | Current Cap workspace, `test -p cap-muxer-protocol --lib`, 7 tests | 21 + 21 | 134.066ms | 13.876ms | **9.66x faster** |
 | [Handy](https://github.com/cjpais/Handy) selected binary `check` | 15 + 15 | 278.439ms | 24.392ms | **11.42x faster** |
 | [Zed](https://github.com/zed-industries/zed) selected binary `check` | 10 + 10 | 587.644ms | 33.711ms | **17.43x faster** |
+| [Bun](https://github.com/oven-sh/bun) workspace root, plain `check`, 108 member targets | 15 + 15 | 161.3ms | 12.6ms | **12.78x faster** |
+| Cap real lib+bin member, plain `check -p scap-targets` | 15 + 15 | 257.3ms | 15.3ms | **16.85x faster** |
 | [Bun](https://github.com/oven-sh/bun) real 489-line retained revision | 7 + 7 | 12.06s | 0.22s | **54.82x faster** |
 
 These results describe the named workloads, not universal Rust compilation
-speed. Full commands, revisions, sample arrays, negative controls, rejected
-experiments, and reproduction details are in the
-[benchmark report](benchmarks/cargo-parity/README.md) and
-[raw results](benchmarks/cargo-parity/results-2026-08-15.tsv).
+speed. Unsupported first-seen edits measured a 4.09% safe-fallback overhead on
+the same machine. Full commands, revisions, sample arrays, negative controls,
+rejected experiments, and reproduction details are in the
+[benchmark report](benchmarks/cargo-parity/README.md) and the raw results
+([2026-08-15](benchmarks/cargo-parity/results-2026-08-15.tsv),
+[2026-08-16](benchmarks/cargo-parity/results-2026-08-16.tsv)).
 
 ## Safety model
 
