@@ -1279,6 +1279,12 @@ fn experimental_direct_check_restores_cargo_target_tmpdir_for_integration_tests(
 
 #[test]
 fn untracked_proc_macro_environment_cannot_produce_a_wrong_replay() {
+    // A procedural macro reads the consumer's CARGO_PKG_VERSION at
+    // expansion time without any dep-info record. With a witnessed complete
+    // environment the graph may replay directly — the replayed compiler
+    // observes exactly the value Cargo would set — and any input that could
+    // change that value (the manifest) must force the command back to
+    // Cargo. Wrongness is impossible either way: parity or fallback.
     let fixture = Fixture::new_library_with_crate_types("\"rlib\"");
     let manifest = fs::read_to_string(fixture.root.join("Cargo.toml")).unwrap();
     fs::write(
@@ -1308,64 +1314,100 @@ pub fn package_version(_: TokenStream) -> TokenStream {
 "#,
     )
     .unwrap();
-    fs::write(
-        &fixture.source,
-        "pub const VERSION: &str = macro_env::package_version!();\npub fn value() -> i32 { 2 }\n",
-    )
-    .unwrap();
-    let initial = fixture.check_selected_lib_direct();
-    assert_success(&initial);
-    assert!(
-        !fixture
+
+    // Establish a recorded state; the recipe appears only when the observer
+    // caught the compilation AND the witness admitted the complete
+    // environment for this proc-macro graph.
+    let mut recipe_established = false;
+    let mut last_errors = String::new();
+    for value in 2..=9 {
+        fs::write(
+            &fixture.source,
+            format!(
+                "pub const VERSION: &str = macro_env::package_version!();\npub fn value() -> i32 {{ {value} }}\n"
+            ),
+        )
+        .unwrap();
+        let output = fixture.check_selected_lib_direct();
+        assert_success(&output);
+        last_errors = stderr(&output);
+        if fixture
             .state_directory()
             .join("check/compiler-recipe")
-            .exists(),
-        "a procedural-macro graph published an unsafe compiler recipe:\n{}",
-        stderr(&initial)
+            .is_file()
+        {
+            recipe_established = true;
+            break;
+        }
+    }
+    assert!(
+        recipe_established,
+        "the witnessed proc-macro graph never recorded a compiler recipe:\n{last_errors}"
     );
 
+    // A body edit replays directly, and Cargo then agrees the artifact is
+    // exactly what it would have produced.
     fs::write(
         &fixture.source,
-        "pub const VERSION: &str = macro_env::package_version!();\npub fn value() -> i32 { 3 }\n",
+        "pub const VERSION: &str = macro_env::package_version!();\npub fn value() -> i32 { 41 }\n",
     )
     .unwrap();
-    let changed = fixture.check_selected_lib_direct();
-    assert_success(&changed);
+    let replayed = fixture.check_selected_lib_direct();
+    assert_success(&replayed);
     assert!(
-        stderr(&changed).contains("Checking cinder-fast-run-fixture"),
-        "a changed procedural-macro consumer did not stay on Cargo:\n{}",
-        stderr(&changed)
+        stderr(&replayed).contains("Cinder replayed Cargo's validated compiler recipe"),
+        "the witnessed proc-macro graph did not replay:\n{}",
+        stderr(&replayed)
     );
-    assert!(
-        !stderr(&changed).contains("Cinder replayed Cargo's validated compiler recipe"),
-        "a procedural macro ran outside Cargo's process contract:\n{}",
-        stderr(&changed)
-    );
-    assert!(
-        !fixture
-            .state_directory()
-            .join("check/compiler-recipe")
-            .exists(),
-        "a fresh procedural-macro dependency failed to suppress recipe publication:\n{}",
-        stderr(&changed)
+    // Whether or not Cargo decides to re-check from its own mtime evidence,
+    // its output must be byte-identical to what the replay produced.
+    let rmeta = fs::read_dir(fixture.root.join("target/debug/deps"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.extension() == Some(OsStr::new("rmeta"))
+                && path
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|name| name.starts_with("libcinder_fast_run_fixture-"))
+        })
+        .expect("the fixture produced no library rmeta");
+    let replayed_bytes = fs::read(&rmeta).unwrap();
+    let cargo_agrees = fixture.cargo_check_selected_lib();
+    assert_success(&cargo_agrees);
+    assert_eq!(
+        fs::read(&rmeta).unwrap(),
+        replayed_bytes,
+        "Cargo disagreed with the replayed proc-macro artifact:\n{}",
+        stderr(&cargo_agrees)
     );
 
+    // The adversarial case: bump the manifest version the macro reads. The
+    // untracked value would change, and the command must return to Cargo —
+    // a replay here would embed the stale version string.
+    let manifest = fs::read_to_string(fixture.root.join("Cargo.toml")).unwrap();
     fs::write(
-        &fixture.source,
-        "pub const VERSION: &str = macro_env::package_version!();\npub fn value() -> i32 { 4 }\n",
+        fixture.root.join("Cargo.toml"),
+        manifest.replace("version = \"1.2.3\"", "version = \"1.2.4\""),
     )
     .unwrap();
-    let repeated = fixture.check_selected_lib_direct();
-    assert_success(&repeated);
+    fs::write(
+        &fixture.source,
+        "pub const VERSION: &str = macro_env::package_version!();\npub fn value() -> i32 { 42 }\n",
+    )
+    .unwrap();
+    let bumped = fixture.check_selected_lib_direct();
+    assert_success(&bumped);
     assert!(
-        stderr(&repeated).contains("Checking cinder-fast-run-fixture"),
-        "a repeated procedural-macro edit escaped Cargo ownership:\n{}",
-        stderr(&repeated)
+        stderr(&bumped).contains("Checking cinder-fast-run-fixture"),
+        "a manifest change the macro observes did not return to Cargo:\n{}",
+        stderr(&bumped)
     );
     assert!(
-        !stderr(&repeated).contains("Cinder replayed Cargo's validated compiler recipe"),
-        "a repeated procedural-macro edit used an unsafe replay:\n{}",
-        stderr(&repeated)
+        !stderr(&bumped).contains("Cinder replayed Cargo's validated compiler recipe"),
+        "a manifest change the macro observes was replayed with stale values:\n{}",
+        stderr(&bumped)
     );
 }
 
@@ -4083,8 +4125,10 @@ fn procedural_macro_members_are_validated_workspace_check_roots() {
     assert!(stderr(&replayed).contains("Cinder reused the validated check of 2 targets"));
     assert!(stderr(&replayed).contains("unused variable: `unused`"));
 
-    // The experimental compiler replay must still refuse recipe publication
-    // for a graph containing a proc-macro target, independent of receipts.
+    // The experimental compiler replay admits a proc-macro graph only when
+    // the recipe carries the complete witnessed environment; without one it
+    // stays refused exactly as before. Either way this multi-root workspace
+    // state never replays directly.
     fs::write(
         &fixture.source,
         "use proc_macro::TokenStream;\n#[proc_macro]\npub fn noop(input: TokenStream) -> TokenStream { let _used = 5; input }\n",
@@ -4101,13 +4145,23 @@ fn procedural_macro_members_are_validated_workspace_check_roots() {
         .env_remove("CINDER_DISABLE_FAST_CHECK");
     let experimental = command.output().unwrap();
     assert_success(&experimental);
-    assert!(
-        stderr(&experimental)
-            .contains("compiler replay disabled by unsupported Cargo target graph"),
-        "a proc-macro member must keep recipe publication disabled:\n{}",
-        stderr(&experimental)
-    );
-    assert!(!stderr(&experimental).contains("Cinder replayed"));
+    let errors = stderr(&experimental);
+    let witness_root = std::env::temp_dir().join("cinder/state/env-witness");
+    let witness_available = fs::read_dir(&witness_root)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .any(|entry| entry.path().join("witness").is_file())
+        })
+        .unwrap_or(false);
+    if !witness_available {
+        assert!(
+            errors.contains("requires a witnessed environment")
+                || errors.contains("compiler replay disabled"),
+            "an unwitnessed proc-macro member must keep recipe publication disabled:\n{errors}"
+        );
+    }
+    assert!(!errors.contains("Cinder replayed"));
 }
 
 #[test]
