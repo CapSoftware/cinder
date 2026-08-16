@@ -556,6 +556,67 @@ state, compiler receipts, recordings, and target artifacts is namespaced by
 process ID; entries older than one hour are removed only after that process is
 no longer live.
 
+## The tuned development toolchain
+
+On macOS, Cinder can route eligible development `build`, `check`, `test`, and
+`run` commands through a locally built `cinder-tuned` rustup toolchain: the
+same rustc source as the active stock toolchain, rebuilt with ThinLTO,
+codegen-units 1, profile-guided optimization, and the parallel frontend
+enabled through `RUSTC_BOOTSTRAP` at Cinder's own invocations. Tuned
+artifacts are functionally equivalent but not byte-identical to stock
+Cargo's. That deliberately amends the earlier byte-identity contract for
+development artifacts only, and two rules keep the amendment safe: tuned
+commands always build inside a separate `target/cinder-tuned` namespace so
+tuned and stock artifacts can never mix, and release or otherwise
+profile-selecting builds always use the stock toolchain unchanged.
+
+Routing is fail-closed. It applies only when no explicit toolchain choice is
+in force (no `+toolchain` argument, no `RUSTUP_TOOLCHAIN`), no
+compiler-affecting environment is present (`RUSTC`, `RUSTDOC`,
+`RUSTC_BOOTSTRAP`, wrappers), the user has not selected a target directory,
+the command names no profile, target, or `-Z` flag, and `CINDER_STOCK` is
+unset. An unpinned project targets the default `cinder-tuned` build. A
+project whose nearest `rust-toolchain` file pins a plain version — `1.88` or
+`1.88.0`, never a dated nightly, `stable`, or a full toolchain name — can
+instead route through a matching per-pin build named `cinder-tuned-1.88` or
+`cinder-tuned-1.88.0`, but only when that build is installed, the pinned
+stock toolchain itself is already installed (Cinder never triggers a rustup
+download), and the probe below passes; any miss honors the pin with stock
+rustup behavior exactly as before. The tuned compiler must pass a cached
+health probe: its `--version` line must contain the reference compiler's
+full version line — the stock default for unpinned projects, the pinned
+stock toolchain for pinned ones; the same-source guarantee that real
+projects enforce implicitly through version sniffing — and it must compile a
+trivial crate, proving the sysroot. Probe verdicts are cached per tuned
+toolchain against the filesystem identities of the tuned compiler, the
+reference compiler, and rustup's settings, so an unchanged installation
+costs a few stats per command and multiple tuned builds coexist.
+
+Each tuned build declares its own compiler flags in a bounded
+`cinder-tuned-flags` file inside the toolchain directory: the default
+stable build carries `-Zthreads=8` (the parallel frontend measured faster
+there), while the Cap-matched `cinder-tuned-1.88` carries none, because
+`-Zthreads` measured inconsistently on that workspace's dependency graphs.
+An absent or empty file means no extra flags; an oversized or malformed file
+makes that tuned build ineligible rather than guessed at.
+`RUSTC_BOOTSTRAP` is set only when an applied flag requires it.
+
+Failures never strand a command. A tuned child that cannot launch disables
+tuned routing machine-wide and reruns the command through stock; a tuned
+child that dies to a signal (a crashed compiler) disables tuned routing for
+that project and reruns through stock. Ordinary compile errors are trusted
+as-is — the compiler shares the stock compiler's source — so a red build is
+never compiled twice. Markers and the tuned namespace are cleared by
+`cinder clean`. The optional Cranelift debug backend
+(`CINDER_TUNED_BACKEND=cranelift`) stays opt-in: it measurably speeds cold
+builds but slightly slows small incremental edits, and one real dependency
+(`schemars` under Cap) miscompiled its capability probe under Cranelift
+during qualification, so it is not part of the default contract. Because the
+routed environment is applied before the command context is computed, tuned
+and stock fast-path states separate naturally through context identity, and
+the recorder's hidden diagnostic passes inherit the same tuned world they
+must validate against.
+
 ## Deliberate non-goals for this milestone
 
 Cinder does not replace release builds, dependency management, distributed
