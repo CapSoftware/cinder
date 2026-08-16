@@ -153,11 +153,33 @@ fn cargo_subcommand_index(arguments: &[OsString]) -> Option<usize> {
     None
 }
 
+pub struct EnvironmentWitness;
+
+pub enum RecipeCapture {
+    Disabled,
+    #[allow(dead_code)]
+    Enabled {
+        witness: Option<EnvironmentWitness>,
+    },
+}
+
+pub fn env_probe_wrapper_main(_arguments: &[OsString]) -> Option<u8> {
+    None
+}
+
+pub fn compiler_environment_witness(_cargo: &Path) -> Option<EnvironmentWitness> {
+    None
+}
+
+pub fn clear_environment_witnesses() -> Result<(), String> {
+    Ok(())
+}
+
 pub fn run_cargo_messages(
     command: &mut Command,
     _receipt_directory: &Path,
     _selection: &PackageSelection,
-    _capture_compiler_recipes: bool,
+    _recipe_capture: &RecipeCapture,
 ) -> Result<ExitStatus, String> {
     command
         .status()
