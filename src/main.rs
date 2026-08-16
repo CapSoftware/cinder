@@ -5,6 +5,7 @@ mod run;
 #[cfg(windows)]
 #[path = "run_windows.rs"]
 mod run;
+mod toolchain;
 #[cfg(not(windows))]
 mod usage;
 #[cfg(windows)]
