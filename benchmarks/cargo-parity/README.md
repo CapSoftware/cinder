@@ -1,5 +1,71 @@
 # Cargo parity benchmarks
 
+## 2026-08-16 diagnostic-replay and multi-root candidate
+
+This series measures the candidate that adds recorded-warning replay on every
+reuse hit, multi-root no-change reuse (multi-target packages and workspace-root
+`check`), per-source identity records for hit validation, and the
+bidi/carriage-return literal-patch rejection. Same machine and toolchain as the
+2026-08-15 series (Apple Silicon, macOS 26.2, Cargo 1.93.0, rustc 1.93.0).
+
+Method: paired alternating Cinder/Cargo trials from one process with a pinned
+volatile shell `_`; each sample times the complete subprocess; one recording
+pass plus a quiet settle window precedes the pairs so the asynchronous
+recorder (which now also runs hidden no-change Cargo passes for diagnostic
+replay) finishes before timing begins. Every Cinder sample required its exact
+reuse marker, including the multi-root target count where applicable, and the
+test row asserted that all seven real tests ran in every Cinder and Cargo
+sample. Raw arrays are in
+[`results-2026-08-16.tsv`](results-2026-08-16.tsv).
+
+| Repository and command | Trials | Cargo median | Cinder median | Result |
+| --- | ---: | ---: | ---: | ---: |
+| Bun workspace root, plain `check --locked`, 108 member targets | 15 / 15 | 0.1613s | 0.0126s | 12.78x faster |
+| Cap `check --locked -p cap-cursor-info --example cli` (regression) | 15 / 15 | 0.2463s | 0.0161s | 15.33x faster |
+| Cap `check --locked -p scap-targets`, real lib+bin member, 2 targets | 15 / 15 | 0.2573s | 0.0153s | 16.85x faster |
+| Cap `test --lib -- --nocapture`, 7 real `cap-muxer-protocol` tests | 15 / 15 | 0.1298s | 0.0052s | 25.17x faster |
+| Cap unique first-seen structural edits (miss tax) | 8 / 8 | 0.3414s | 0.3553s | Cinder 4.09% slower |
+
+The two regression rows are consistent with the 2026-08-15 baselines (16.34x
+and 25.29x); the differences are within run-to-run Cargo variance. The
+first-seen edit tax matches the previously recorded 4.39–4.43% safe-fallback
+overhead, so the new recording work (invocation staging plus hidden replay
+passes) added no measurable user-visible miss cost; recording remains outside
+the timed command. The first Cinder tax sample was a retained 0.531s outlier
+that overlapped initial state recording.
+
+The Bun workspace-root row is a new capability that required two corrections
+before it could be reported honestly, and both superseded series are retained
+in the raw file. First, the initial implementation validated the recorded
+revision by re-hashing all workspace sources on every hit and measured only
+1.47x (0.1090s median, the pre-identity-record candidate). Recording each
+source's filesystem identity and content digest, trusting an unchanged
+identity, and re-hashing only identity mismatches cut hit validation from
+110ms to 4ms. Second, the resulting 12.95x measurement was itself invalidated
+by review: Bun's root check builds ten procedural-macro units, five of them
+real workspace members, whose receipts were silently dropped, so the recorded
+98-target state omitted built units whose edits could not invalidate it — the
+exact stale-success hazard the receipt-gap guard now refuses. After
+procedural-macro units became ordinary check-mode roots, the final candidate
+records all 108 built member targets and measures 12.78x with every built
+unit validated. The invalidated 98-target series is retained and labeled in
+the raw file.
+
+Two methodology caveats. Cinder's context identity binds the complete
+environment, so paired trials must run from one parent process; consecutive
+interactive shells differ in volatile variables and correctly record separate
+states. And sustained sub-second command churn can starve the asynchronous
+recorder (its hidden no-change pass retreats when another Cargo holds the
+target lock), which delays state publication until the project goes quiet;
+this fails closed to ordinary Cargo runs and never affects an already
+published state.
+
+All workloads in this series are warning-free, so the recorded diagnostic
+replay contributed no bytes to the timed hits; the warning-replay contract is
+covered by the integration suite, which verifies the replayed region
+byte-for-byte against Cargo's own no-change replay.
+
+
 These measurements cover Cinder's selected `build`, no-change `check`, selected
 `test --no-run`, and repeated package or workspace-selected `test --lib` paths on real
 repositories. The main series was
