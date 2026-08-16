@@ -668,6 +668,20 @@ impl State {
             .is_file()
             .then(|| read_compiler_recipe(&compiler_recipe_path).ok())
             .flatten();
+        // States recorded before diagnostic replay existed cannot prove what a
+        // real no-change Cargo pass would print, so they are ordinary misses.
+        let diagnostics_path = root.join("diagnostics");
+        if !diagnostics_path.is_file() {
+            return Ok(None);
+        }
+        let diagnostics = read_diagnostics(&diagnostics_path)?;
+        // States recorded before multi-root support cannot prove which sibling
+        // units their command selected, so they are ordinary misses.
+        let sibling_roots_path = root.join("sibling-roots");
+        if !sibling_roots_path.is_file() {
+            return Ok(None);
+        }
+        let sibling_roots = read_sibling_roots(&sibling_roots_path)?;
         let artifact = PathBuf::from(OsString::from_vec(artifact_bytes));
         let public_artifact = match fs::read(root.join("public-artifact")) {
             Ok(value) => PathBuf::from(OsString::from_vec(value)),
@@ -710,6 +724,7 @@ impl State {
         program_name: &OsStr,
         run_context: &[u8],
         receipt: Option<&ArtifactReceipt>,
+        diagnostics: Option<DiagnosticsReplay>,
     ) -> Result<(), String> {
         Self::record_fresh_with_runtime_directory(
             directory,
@@ -719,6 +734,7 @@ impl State {
             run_context,
             receipt,
             None,
+            diagnostics,
         )
     }
 
@@ -729,6 +745,7 @@ impl State {
         run_context: &[u8],
         receipt: &ArtifactReceipt,
         runtime_directory: &Path,
+        diagnostics: Option<DiagnosticsReplay>,
     ) -> Result<(), String> {
         let runtime_directory = fs::canonicalize(runtime_directory)
             .map_err(|error| format!("could not resolve Cargo test working directory: {error}"))?;
@@ -754,9 +771,11 @@ impl State {
             run_context,
             Some(receipt),
             Some(&runtime_directory),
+            diagnostics,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record_fresh_with_runtime_directory(
         directory: &Path,
         kind: StateKind,
@@ -765,6 +784,7 @@ impl State {
         run_context: &[u8],
         receipt: Option<&ArtifactReceipt>,
         runtime_directory: Option<&Path>,
+        diagnostics: Option<DiagnosticsReplay>,
     ) -> Result<(), String> {
         let runtime_directory = runtime_directory
             .map(fs::canonicalize)
@@ -830,10 +850,25 @@ impl State {
                         && state.sources == sources
                         && state.artifact_is_unchanged().unwrap_or(false)
                         && state.inputs_are_unchanged(directory).unwrap_or(false))
-                    .then_some((state.inputs, state.project_topology))
+                    .then_some((state.inputs, state.project_topology, state.diagnostics))
                 })
         } else {
             None
+        };
+        // A state without a proven diagnostic replay would let a reuse hit
+        // swallow the warnings Cargo replays on every no-change command. An
+        // inherited state proved its replay for this same source revision.
+        let diagnostics = match diagnostics {
+            Some(diagnostics) => diagnostics,
+            None => match &inherited_state {
+                Some((_, _, diagnostics)) => diagnostics.clone(),
+                None => {
+                    return Err(
+                        "no recorded Cargo invocation proves the diagnostic replay; using Cargo"
+                            .to_owned(),
+                    );
+                }
+            },
         };
         let runtime_environment = if matches!(kind, StateKind::Run | StateKind::Test) {
             runtime_linker_environment()
@@ -887,7 +922,7 @@ impl State {
                 build_literal_index(&capture, &sources, artifact)?
             };
             let (inputs, project_topology) = match &inherited_state {
-                Some((inputs, project_topology)) => (inputs.clone(), project_topology.clone()),
+                Some((inputs, project_topology, _)) => (inputs.clone(), project_topology.clone()),
                 None => {
                     let (project_topology, project_inputs) =
                         project_topology_and_inputs(directory, artifact)?;
