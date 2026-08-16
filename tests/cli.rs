@@ -15,10 +15,12 @@ fn forwards_arguments_environment_and_exit_status_to_cargo() {
     let directory =
         std::env::temp_dir().join(format!("cinder-cli-{}-{unique}", std::process::id()));
     fs::create_dir(&directory).unwrap();
+    let temporary = directory.join("tmp");
+    fs::create_dir(&temporary).unwrap();
     let fake_cargo = directory.join("cargo");
     fs::write(
         &fake_cargo,
-        "#!/bin/sh\nprintf 'arg=<%s>\\n' \"$@\"\nprintf 'probe=<%s>\\n' \"$CINDER_TEST_PROBE\"\nexit 23\n",
+        "#!/bin/sh\nprintf 'arg=<%s>\\n' \"$@\"\nprintf 'probe=<%s>\\n' \"$CINDER_TEST_PROBE\"\nprintf 'usage=<%s>\\n' \"$CINDER_USAGE\"\nprintf 'direct=<%s>\\n' \"$CINDER_EXPERIMENTAL_DIRECT_CHECK\"\nexit 23\n",
     )
     .unwrap();
     let mut permissions = fs::metadata(&fake_cargo).unwrap().permissions();
@@ -26,8 +28,12 @@ fn forwards_arguments_environment_and_exit_status_to_cargo() {
     fs::set_permissions(&fake_cargo, permissions).unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_cinder"))
+        .current_dir(&directory)
         .env("CINDER_REAL_CARGO", &fake_cargo)
         .env("CINDER_TEST_PROBE", "preserved")
+        .env("CINDER_USAGE", "1")
+        .env("CINDER_EXPERIMENTAL_DIRECT_CHECK", "1")
+        .env("XDG_STATE_HOME", &temporary)
         .args(["check", "--features", "one two"])
         .output()
         .unwrap();
@@ -35,8 +41,27 @@ fn forwards_arguments_environment_and_exit_status_to_cargo() {
     assert_eq!(output.status.code(), Some(23));
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "arg=<check>\narg=<--features>\narg=<one two>\nprobe=<preserved>\n"
+        "arg=<check>\narg=<--features>\narg=<one two>\nprobe=<preserved>\nusage=<>\ndirect=<>\n"
     );
+
+    let report = Command::new(env!("CARGO_BIN_EXE_cinder"))
+        .env("XDG_STATE_HOME", &temporary)
+        .args(["stats", "--json"])
+        .output()
+        .unwrap();
+    assert!(report.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
+    assert_eq!(report["schema_version"], 2);
+    assert_eq!(report["recorded_decisions"], 1);
+    assert_eq!(report["fast_path_selections"], 0);
+    assert_eq!(report["cargo_fallbacks"], 1);
+    assert_eq!(report["commands"][2]["command"], "check");
+    assert_eq!(report["commands"][2]["outcomes"]["cargo_fallback"], 1);
+
+    let evidence = fs::read(temporary.join("cinder/events-v1")).unwrap();
+    assert_eq!(evidence.len(), 16);
+    assert!(!evidence.windows(7).any(|window| window == b"one two"));
+    assert!(!evidence.windows(9).any(|window| window == b"preserved"));
     fs::remove_dir_all(directory).unwrap();
 }
 

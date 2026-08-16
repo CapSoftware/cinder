@@ -1,7 +1,7 @@
 //! Unit tests for private runtime boundaries shared across the focused modules.
 
 use super::{
-    DISABLE_FAST_BUILD, LaunchPolicy, RUN_CONTEXT_FILE, StateKind,
+    DISABLE_FAST_BUILD, LaunchPolicy, StateKind,
     cache::{
         directory_logical_bytes, project_namespace, prune_global_history_at, prune_run_artifacts,
         prune_stale_artifact_staging, prune_stale_global_staging, prune_stale_history_staging,
@@ -9,28 +9,362 @@ use super::{
         state_project_directory,
     },
     capture::rustc_list_options,
-    cargo::{cargo_config_contents_may_change_runner_or_target, toml_string, unsupported_argument},
+    cargo::{
+        cargo_config_contents_may_change_runner_or_target,
+        cargo_config_contents_may_set_rustc_wrapper,
+        manifest_contents_have_standard_library_test_harness, toml_string, unsupported_argument,
+    },
     cargo_subcommand,
     context::{
         cargo_fingerprint_value, cargo_fingerprint_value_index, environment_affects_context,
         parse_encoded_dependency_environment,
     },
-    inputs::artifact_file_identity,
+    inputs::{
+        PROJECT_TOPOLOGY_MAGIC, add_build_script_inputs, artifact_file_identity, input_identity,
+        primary_dependency_file, project_topology, project_topology_is_unchanged,
+        read_cargo_outputs, read_inputs, read_project_topology, write_cargo_outputs, write_inputs,
+        write_project_topology,
+    },
     patch::{
         CodeSignatureContract, PatchMode, changed_format_segment, code_signature_contract,
         patch_artifact,
     },
     run_context,
     source::{LiteralChange, changed_plain_literal, source_literal_candidates},
-    state::{CargoOutputs, LiteralIndexEntry, State, StatePublication, write_state_directory},
+    state::{
+        ArtifactFileIdentity, ArtifactReceipt, BuildScriptOutput, CargoOutputEntry, CargoOutputs,
+        InputEntry, LiteralIndexEntry, ProjectTopology, State, StatePublication,
+        read_artifact_receipt, write_artifact_receipt, write_state_directory,
+    },
 };
 use std::{
+    collections::BTreeSet,
     ffi::{OsStr, OsString},
     fs,
     path::{Path, PathBuf},
     process::Command,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+#[test]
+fn artifact_receipt_round_trips_the_complete_build_script_graph_and_rejects_trailing_data() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "cinder-artifact-receipt-{unique}-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let path = root.join("artifact.receipt");
+    let receipt = ArtifactReceipt {
+        artifact: root.join("target/debug/deps/libapp.rlib"),
+        dependency_file: root.join("target/debug/deps/app.d"),
+        public_file_name: OsString::from("libapp.rlib"),
+        crate_type: "rlib".to_owned(),
+        manifest_directory: Some(root.join("app")),
+        out_directory: None,
+        package_manifests: vec![
+            root.join("app/Cargo.toml"),
+            root.join("dependency-a/Cargo.toml"),
+        ],
+        build_script_outputs: vec![
+            BuildScriptOutput {
+                manifest_directory: root.join("dependency-a"),
+                out_directory: root.join("target/debug/build/dependency-a/out"),
+            },
+            BuildScriptOutput {
+                manifest_directory: root.join("dependency-b"),
+                out_directory: root.join("target/debug/build/dependency-b/out"),
+            },
+        ],
+        compiler_recipe: None,
+    };
+
+    write_artifact_receipt(&path, &receipt).unwrap();
+    let read = read_artifact_receipt(&path).unwrap();
+    assert_eq!(read.artifact, receipt.artifact);
+    assert_eq!(read.dependency_file, receipt.dependency_file);
+    assert_eq!(read.public_file_name, receipt.public_file_name);
+    assert_eq!(read.crate_type, receipt.crate_type);
+    assert_eq!(read.manifest_directory, receipt.manifest_directory);
+    assert_eq!(read.out_directory, receipt.out_directory);
+    assert_eq!(read.package_manifests, receipt.package_manifests);
+    assert_eq!(read.build_script_outputs, receipt.build_script_outputs);
+
+    let no_build_script = ArtifactReceipt {
+        artifact: receipt.artifact.clone(),
+        dependency_file: receipt.dependency_file.clone(),
+        public_file_name: receipt.public_file_name.clone(),
+        crate_type: receipt.crate_type.clone(),
+        manifest_directory: receipt.manifest_directory.clone(),
+        out_directory: None,
+        package_manifests: receipt.package_manifests.clone(),
+        build_script_outputs: Vec::new(),
+        compiler_recipe: None,
+    };
+    let mut inputs = BTreeSet::new();
+    add_build_script_inputs(&no_build_script, &mut inputs).unwrap();
+    assert!(inputs.is_empty());
+
+    use std::io::Write as _;
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"unexpected")
+        .unwrap();
+    let error = read_artifact_receipt(&path)
+        .err()
+        .expect("receipt with trailing data must be rejected");
+    assert!(error.contains("trailing data"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn cargo_output_state_round_trips_the_complete_unit_graph_and_rejects_trailing_data() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "cinder-cargo-outputs-{unique}-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let path = root.join("cargo-outputs");
+    let outputs = CargoOutputs {
+        dependency_file: root.join("target/debug/deps/app.d"),
+        artifact: root.join("target/debug/deps/libapp.rmeta"),
+        fingerprint: root.join("target/debug/.fingerprint/app-selected"),
+        unit_fingerprints: vec![
+            root.join("target/debug/.fingerprint/app-selected"),
+            root.join("target/debug/.fingerprint/dependency-unit"),
+        ],
+        unit_dependency_files: vec![
+            root.join("target/debug/deps/app.d"),
+            root.join("target/debug/deps/dependency.d"),
+        ],
+        unit_artifacts: vec![
+            root.join("target/debug/deps/libapp.rmeta"),
+            root.join("target/debug/deps/libdependency.rmeta"),
+        ],
+        unit_fingerprint_files: vec![CargoOutputEntry {
+            path: root.join("target/debug/.fingerprint/app-selected/lib-app"),
+            identity: ArtifactFileIdentity {
+                size: 16,
+                modified_ns: 42,
+                device: 1,
+                inode: 2,
+                changed_seconds: 3,
+                changed_nanoseconds: 4,
+            },
+        }],
+    };
+
+    write_cargo_outputs(&path, &outputs).unwrap();
+    let valid_state = fs::read(&path).unwrap();
+    let read = read_cargo_outputs(&path).unwrap();
+    assert_eq!(read.dependency_file, outputs.dependency_file);
+    assert_eq!(read.artifact, outputs.artifact);
+    assert_eq!(read.fingerprint, outputs.fingerprint);
+    assert_eq!(read.unit_fingerprints, outputs.unit_fingerprints);
+    assert_eq!(read.unit_dependency_files, outputs.unit_dependency_files);
+    assert_eq!(read.unit_artifacts, outputs.unit_artifacts);
+    assert_eq!(
+        read.unit_fingerprint_files[0].path,
+        outputs.unit_fingerprint_files[0].path
+    );
+    assert_eq!(
+        read.unit_fingerprint_files[0].identity,
+        outputs.unit_fingerprint_files[0].identity
+    );
+
+    use std::io::Write as _;
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"unexpected")
+        .unwrap();
+    let error = read_cargo_outputs(&path)
+        .err()
+        .expect("Cargo output state with trailing data must be rejected");
+    assert!(error.contains("trailing data"));
+    fs::write(&path, &valid_state[..valid_state.len() - 1]).unwrap();
+    let error = read_cargo_outputs(&path)
+        .err()
+        .expect("truncated Cargo output state must be rejected");
+    assert!(error.contains("truncated"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn project_topology_state_round_trips_and_rejects_trailing_data() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "cinder-project-topology-{unique}-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(root.join("src/nested")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn value() {}\n").unwrap();
+    let topology = project_topology(&root, &root.join("target/debug/app")).unwrap();
+    let path = root.join("project-topology");
+
+    write_project_topology(&path, &topology).unwrap();
+    let valid_state = fs::read(&path).unwrap();
+    let read = read_project_topology(&path).unwrap();
+    assert_eq!(read.digest, topology.digest);
+    assert_eq!(read.directories.len(), topology.directories.len());
+    for (read, written) in read.directories.iter().zip(&topology.directories) {
+        assert_eq!(read.path, written.path);
+        assert_eq!(read.identity, written.identity);
+        assert_eq!(read.subtree_digest, written.subtree_digest);
+    }
+
+    let mut obsolete = valid_state.clone();
+    obsolete[..PROJECT_TOPOLOGY_MAGIC.len()].copy_from_slice(b"CNDT0002");
+    fs::write(&path, obsolete).unwrap();
+    let error = read_project_topology(&path)
+        .err()
+        .expect("topology state without subtree evidence must be rejected");
+    assert!(error.contains("unsupported format"));
+    fs::write(&path, &valid_state).unwrap();
+
+    use std::io::Write as _;
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"unexpected")
+        .unwrap();
+    let error = read_project_topology(&path)
+        .err()
+        .expect("topology state with trailing data must be rejected");
+    assert!(error.contains("trailing data"));
+    fs::write(&path, &valid_state[..valid_state.len() - 1]).unwrap();
+    let error = read_project_topology(&path)
+        .err()
+        .expect("truncated topology state must be rejected");
+    assert!(error.contains("truncated"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn project_topology_rescans_only_a_changed_subtree_and_rejects_new_rust_paths() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "cinder-project-subtree-{unique}-{}",
+        std::process::id()
+    ));
+    let source = root.join("src");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+    fs::write(source.join("lib.rs"), "pub fn value() {}\n").unwrap();
+    let artifact = root.join("target/debug/app");
+    let topology = project_topology(&root, &artifact).unwrap();
+
+    let editor_staging = source.join(".editor-staging");
+    fs::write(&editor_staging, b"temporary").unwrap();
+    fs::remove_file(editor_staging).unwrap();
+    assert!(project_topology_is_unchanged(&topology, &root, &artifact).unwrap());
+
+    fs::write(source.join("new_module.rs"), "pub fn added() {}\n").unwrap();
+    assert!(!project_topology_is_unchanged(&topology, &root, &artifact).unwrap());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn project_topology_ignores_unrelated_ancestor_churn_but_detects_cargo_controls() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let container = std::env::temp_dir().join(format!(
+        "cinder-project-controls-{unique}-{}",
+        std::process::id()
+    ));
+    let root = container.join("project");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn value() {}\n").unwrap();
+    let artifact = root.join("target/debug/app");
+    let topology = project_topology(&root, &artifact).unwrap();
+
+    let unrelated = container.join("unrelated-editor-file");
+    fs::write(&unrelated, b"temporary").unwrap();
+    fs::remove_file(unrelated).unwrap();
+    assert!(project_topology_is_unchanged(&topology, &root, &artifact).unwrap());
+
+    fs::create_dir(container.join(".cargo")).unwrap();
+    fs::write(container.join(".cargo/config.toml"), "[build]\n").unwrap();
+    assert!(!project_topology_is_unchanged(&topology, &root, &artifact).unwrap());
+    fs::remove_dir_all(container).unwrap();
+}
+
+#[test]
+fn input_state_round_trips_ordered_absolute_entries_and_rejects_trailing_data() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "cinder-input-state-{unique}-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let first = root.join("first");
+    let second = root.join("second");
+    fs::write(&first, b"one").unwrap();
+    fs::write(&second, b"two").unwrap();
+    let inputs = [&first, &second]
+        .into_iter()
+        .map(|path| {
+            let (identity, digest) = input_identity(path).unwrap();
+            InputEntry {
+                path: path.clone(),
+                identity,
+                digest,
+            }
+        })
+        .collect::<Vec<_>>();
+    let path = root.join("inputs");
+
+    write_inputs(&path, &inputs).unwrap();
+    let valid_state = fs::read(&path).unwrap();
+    let read = read_inputs(&path).unwrap();
+    assert_eq!(read.len(), inputs.len());
+    for (read, written) in read.iter().zip(&inputs) {
+        assert_eq!(read.path, written.path);
+        assert_eq!(read.identity, written.identity);
+        assert_eq!(read.digest, written.digest);
+    }
+
+    use std::io::Write as _;
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"unexpected")
+        .unwrap();
+    let error = read_inputs(&path)
+        .err()
+        .expect("input state with trailing data must be rejected");
+    assert!(error.contains("trailing data"));
+    fs::write(&path, &valid_state[..valid_state.len() - 1]).unwrap();
+    let error = read_inputs(&path)
+        .err()
+        .expect("truncated input state must be rejected");
+    assert!(error.contains("truncated"));
+    fs::remove_dir_all(root).unwrap();
+}
 
 #[test]
 fn global_revision_cache_prunes_oldest_bytes_and_deleted_workspaces() {
@@ -82,6 +416,43 @@ fn global_revision_cache_prunes_oldest_bytes_and_deleted_workspaces() {
 }
 
 #[test]
+fn public_artifact_mapping_requires_the_exact_cargo_fingerprint() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "cinder-artifact-mapping-{}-{unique}",
+        std::process::id()
+    ));
+    let profile = root.join("target/debug");
+    let dependencies = profile.join("deps");
+    fs::create_dir_all(&dependencies).unwrap();
+    let public = profile.join("app");
+    let correct = dependencies.join("app-a1b2c3d4");
+    let stale = dependencies.join("app-deadbeef");
+    fs::write(&public, b"correct!").unwrap();
+    fs::write(&correct, b"correct!").unwrap();
+    fs::write(&stale, b"stale!!!").unwrap();
+    fs::write(correct.with_extension("d"), b"app: src/main.rs\n").unwrap();
+    fs::write(stale.with_extension("d"), b"app: src/main.rs\n").unwrap();
+    fs::create_dir_all(profile.join(".fingerprint/app-a1b2c3d4")).unwrap();
+    let modified = fs::metadata(&public).unwrap().modified().unwrap();
+    for artifact in [&correct, &stale] {
+        fs::File::open(artifact)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+    }
+
+    assert_eq!(
+        primary_dependency_file(&public).unwrap(),
+        correct.with_extension("d")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn global_revision_budget_includes_restored_run_artifacts() {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -116,7 +487,11 @@ fn global_revision_budget_includes_restored_run_artifacts() {
         artifact: target.join("deps/app"),
         fingerprint: target.join(".fingerprint/app"),
         unit_fingerprints: Vec::new(),
+        unit_dependency_files: Vec::new(),
+        unit_artifacts: Vec::new(),
+        unit_fingerprint_files: Vec::new(),
     };
+    let topology = project_topology(&source_root, &cached).unwrap();
     write_state_directory(
         &entry,
         StatePublication {
@@ -131,9 +506,13 @@ fn global_revision_budget_includes_restored_run_artifacts() {
             run_context: &[],
             observes_underscore: false,
             inputs: &[],
+            project_topology: &topology,
             sources: &sources,
             cargo_outputs: &cargo_outputs,
+            cargo_fingerprints_current: true,
             runtime_environment: &[],
+            runtime_directory: None,
+            compiler_recipe: None,
             duplicate_ready: false,
         },
         &cached,
@@ -423,14 +802,24 @@ fn patching_preserves_ad_hoc_entitlements_and_hardened_runtime() {
         run_context: Vec::new(),
         observes_underscore: false,
         inputs: Vec::new(),
+        project_topology: ProjectTopology {
+            digest: [0; 32],
+            directories: Vec::new(),
+        },
         sources: Vec::new(),
         cargo_outputs: CargoOutputs {
             dependency_file: PathBuf::new(),
             artifact: PathBuf::new(),
             fingerprint: PathBuf::new(),
             unit_fingerprints: Vec::new(),
+            unit_dependency_files: Vec::new(),
+            unit_artifacts: Vec::new(),
+            unit_fingerprint_files: Vec::new(),
         },
+        cargo_fingerprints_current: false,
         runtime_environment: Vec::new(),
+        runtime_directory: None,
+        compiler_recipe: None,
     };
     let change = LiteralChange {
         relative: PathBuf::from("src/main.rs"),
@@ -550,11 +939,29 @@ fn hashes_context_instead_of_persisting_arguments_or_environment() {
 fn preserves_compiler_observable_environment_in_build_contexts() {
     assert!(!environment_affects_context(OsStr::new("_")));
     assert!(environment_affects_context(OsStr::new("SHLVL")));
-    assert!(environment_affects_context(OsStr::new("CINDER_TRACE_RUN")));
+    assert!(!environment_affects_context(OsStr::new(super::TRACE_RUN)));
+    assert!(!environment_affects_context(OsStr::new(
+        super::SYNCHRONOUS_STATE_RECORDING
+    )));
+    assert!(!environment_affects_context(OsStr::new(
+        "CINDER_REAL_CARGO"
+    )));
+    assert!(!environment_affects_context(OsStr::new(
+        "CINDER_COALESCE_RUN_EVENTS"
+    )));
+    assert!(environment_affects_context(OsStr::new("CINDER_UNKNOWN")));
     assert!(environment_affects_context(OsStr::new("RUSTFLAGS")));
     assert!(environment_affects_context(OsStr::new("BUN_CODEGEN_DIR")));
-    assert!(!environment_affects_context(OsStr::new(RUN_CONTEXT_FILE)));
+    assert!(!environment_affects_context(OsStr::new(
+        "CINDER_RUN_CONTEXT_FILE"
+    )));
     assert!(!environment_affects_context(OsStr::new(DISABLE_FAST_BUILD)));
+    assert!(!environment_affects_context(OsStr::new(
+        crate::usage::USAGE_ENVIRONMENT
+    )));
+    assert!(!environment_affects_context(OsStr::new(
+        super::EXPERIMENTAL_DIRECT_CHECK
+    )));
 }
 
 #[test]
@@ -678,6 +1085,43 @@ fn cargo_config_only_disables_overrides_that_change_execution() {
             "[target.aarch64-apple-darwin]\nrunner = \"tool\"\n"
         )
         .unwrap()
+    );
+    assert!(!cargo_config_contents_may_set_rustc_wrapper(zed_style).unwrap());
+    assert!(
+        cargo_config_contents_may_set_rustc_wrapper("[build]\nrustc-wrapper = \"sccache\"\n")
+            .unwrap()
+    );
+    assert!(
+        cargo_config_contents_may_set_rustc_wrapper(
+            "[build]\nrustc-workspace-wrapper = \"workspace-cache\"\n"
+        )
+        .unwrap()
+    );
+}
+
+#[test]
+fn direct_test_execution_requires_the_standard_library_harness() {
+    assert!(
+        manifest_contents_have_standard_library_test_harness(
+            "[package]\nname='app'\nversion='0.1.0'\n"
+        )
+        .unwrap()
+    );
+    assert!(
+        manifest_contents_have_standard_library_test_harness(
+            "[package]\nname='app'\nversion='0.1.0'\n[lib]\nharness=true\n"
+        )
+        .unwrap()
+    );
+    assert!(
+        !manifest_contents_have_standard_library_test_harness(
+            "[package]\nname='app'\nversion='0.1.0'\n[lib]\nharness=false\n"
+        )
+        .unwrap()
+    );
+    assert!(
+        !manifest_contents_have_standard_library_test_harness("[workspace]\nmembers=['app']\n")
+            .unwrap()
     );
 }
 
