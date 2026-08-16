@@ -60,23 +60,64 @@ compiler artifacts and build-script output directories. Cinder consumes only
 known Cargo records through `build-finished`; unknown output is forwarded, and
 all later bytes are application output and are forwarded without parsing.
 
-Before enabling capture, Cinder establishes one exact selected package. For a
-normal package-directory invocation without `-p`, it matches Cargo's artifact
-message to the canonical manifest path after verifying that the manifest has a
-package table. Workspace package selections are resolved to Cargo's exact
-package ID; that result is cached under the hashed command context so repeated
-first-seen edits do not spawn a second Cargo process just for resolution. The
-cache is owner-local, bounded, context-bound, cleared by `cinder clean`, and
+Before enabling capture, Cinder establishes the exact selected package set.
+For a normal package-directory invocation without `-p`, it matches Cargo's
+artifact messages to the canonical manifest path after verifying that the
+manifest has a package table and no workspace table that changes the selected
+set. Workspace package selections are resolved to Cargo's exact package ID;
+that result is cached under the hashed command context so repeated first-seen
+edits do not spawn a second Cargo process just for resolution. The cache is
+owner-local, bounded, context-bound, cleared by `cinder clean`, and
 self-invalidates whenever the message stream has no artifact for the cached ID.
+A workspace-root `check` — a manifest with a `[workspace]` table, no package
+selection, and no target selectors — instead selects every member unit whose
+canonical manifest lies under the canonical invocation root, with build-script
+output directories resolved per receipt by package ID. Every `members` and
+`default-members` declaration must be a relative path or glob without a
+parent-directory component: a member declared outside the root would produce
+units the root matcher can never select, so its edits could not invalidate the
+recorded state, and such workspaces disable capture entirely. A root-package
+manifest with explicit `default-members` can make any other command build
+members outside one package's dependency closure, so those shapes disable
+capture entirely rather than recording only part of what Cargo built.
 
 Unsupported Cargo implementations, ambiguous default workspace members,
 complex package selections that cannot be resolved exactly, and failed probes
 disable capture and preserve the original command unchanged. The successful
 message path records primary linked artifacts, exact hashed artifacts and
 dep-info, target type, manifest directory, and selected build-script output.
-Cinder proceeds only when later artifact selection is unambiguous. Explicit
-single-bin, single-lib, single-example, and narrow check/test targets are
-supported; ambiguous output sets remain on Cargo.
+Explicit single-bin, single-lib, single-example, and narrow check/test targets
+remain supported exactly as before. A default target set that produces several
+root units — a lib-and-bin package `check` or `build`, or a workspace-root
+`check` — records every selected unit as a root, bounded to 256 roots; the
+lexicographically first artifact is the primary root and the rest become
+sibling roots whose reachable unit graphs are merged into one validated Cargo
+output graph. Procedural-macro units are ordinary recorded `check` roots: each
+of Cargo's metadata and compiled-macro units carries its own hashed artifact,
+dep-info, and fingerprint, and macro-time environment reads are bound by the
+whole-environment context identity. `build` recording still refuses
+proc-macro roots, and the experimental compiler replay keeps rejecting any
+graph containing a proc-macro target. A selected unit that yields no artifact
+receipt for any reason other than being a build script — a multi-crate-type
+target, an unknown layout — is a counted receipt gap, and a default target
+set with any gap refuses to record: a state that silently omitted a built
+unit could later reuse while that unit fails. Each sibling keeps its own artifact identity, content digest,
+dep-info, hashed artifact, and fingerprint directory, all bounded and rejected
+on truncation or trailing data. A root whose package declares a build script
+must carry that script's exact output receipt, and every executed build script
+must be reachable from some root's fingerprint graph. Because an unchanged
+sibling keeps its older artifact timestamp, each root bounds its own consumed
+sources: a source newer than both that root's artifact and the staged
+invocation written before the Cargo child spawned may be a mid-command edit
+the root never saw, and the recording is abandoned rather than binding new
+source content to a stale sibling artifact. Control inputs, which Cargo itself
+may rewrite after the command starts, use the widest bound — the staged
+invocation or the earliest root artifact Cargo rebuilt during this command. Multi-root states are
+current-state-only: never retained in revision history, never patched, never
+directly executed, and never replayed through the experimental compiler path.
+A reuse hit revalidates every root and prints one line naming the root count,
+while single-root states keep the existing marker byte-for-byte. Ambiguous
+output sets and root counts beyond the bound remain on Cargo.
 
 Neither default capture nor the opt-in recipe experiment installs or replaces
 `RUSTC_WRAPPER`, and Cinder's internal receipt controls are not placed in
@@ -106,6 +147,46 @@ source and input state. A no-change validation path skips Cargo's graph walk
 for selected check/test outputs that still have their complete exact Cargo
 state; for the narrow standard-library test shape, it then runs the exact
 validated Cargo-built harness rather than suppressing test execution.
+
+Cargo replays cached compiler warnings and manifest diagnostics on every
+no-change command, so a reuse hit that printed only Cinder's marker would
+silently drop user-visible output. After Cargo succeeds, the recorder therefore
+runs a hidden no-change Cargo pass with piped output: the recorded command for
+`build` and `check`, the command with `--no-run` and without harness arguments
+for `test`, and the equivalent selected `build` for `run`. The pass must exit
+successfully and print exactly one `Finished` status line; the raw stderr bytes
+before that line are stored with the state, bounded to 4 MiB per variant. Any
+compile, download, or other status marker proves Cargo had not converged, and
+the entire recording is abandoned rather than published without proven replay
+bytes. Transient `Blocking` lock-wait lines from a concurrent Cargo are
+removed from the stored region: the pass still completed normally, rendered
+diagnostics gutter every source line so a diagnostic body cannot forge that
+status shape, and an uncontended future no-change command prints the same
+bytes without them.
+Before any hidden pass spawns, every source consumed by the staged receipts
+must predate the staged invocation file; a newer source means the user kept
+editing after the command, and the pass is skipped so the detached recorder
+can never start a real, unrequested background compile. The status
+classification is a conservative list of Cargo's current status verbs under
+the pinned Cargo versions Cinder is validated against; a future Cargo status
+verb unknown to that list would be recorded into the replay region rather than
+rejected, which is a known limitation of parsing rendered output — Cargo's
+JSON mode cannot replace it because it suppresses the per-crate warning-count
+summary line.
+When the region is nonempty and the user pinned Cargo's color choice through
+`CARGO_TERM_COLOR` or a configured `term.color` other than `auto`, one pass
+records the single pinned rendering; otherwise two passes record Cargo's plain
+and ANSI renderings, and a hit selects the variant matching whether Cinder's
+stderr is a terminal. Cargo's automatic choice additionally honors `NO_COLOR`,
+`CLICOLOR_FORCE`, and a dumb terminal; Cinder does not model that rendering
+matrix, so a nonempty region recorded under any of those variables abandons
+the recording instead. Every exact-state reuse hit, direct test execution,
+restored revision, and fast run replays the recorded bytes before Cinder's
+marker; the reuse test suite verifies the replayed warning region byte-for-byte
+against Cargo's own no-change replay. States recorded before this contract
+existed are ordinary misses. The equal-length string patch and the experimental
+compiler-recipe replay produce source Cargo never rendered, so both require a
+state with no recorded diagnostics and otherwise stay on Cargo.
 
 The first optimization targets small data-only edits: equal-byte-length UTF-8
 changes to either an ordinary unescaped Rust string or the data after the sole
@@ -272,14 +353,26 @@ contain:
 
 - a SHA-256 digest of the exact Cargo invocation/environment context, never
   the raw environment values;
-- content digests plus a validated list and snapshot of project Rust sources;
+- content digests plus a validated list and snapshot of project Rust sources,
+  where each listed source also records its publication-time filesystem
+  identity and content digest so a no-change hit trusts unchanged identities,
+  re-reads only an identity-changed file, and treats a touched-but-identical
+  file as the same revision (this trust model assumes the accelerated
+  platform's nanosecond filesystem timestamps, as APFS provides);
 - reference artifact filesystem identity and publication-time content digest;
 - Cargo dep-info, manifest, lockfile, configuration, consumed Rust source, and
   build-script input full filesystem identities and content digests;
 - Cargo's exact hashed artifact, dep-info, and fingerprint paths;
 - Cargo's platform runtime dynamic-library path for fast `run` and selected
   library-test launches;
-- a precomputed index of unique eligible string data.
+- a precomputed index of unique eligible string data;
+- the proven no-change diagnostic replay: nothing, one pinned-color rendering,
+  or Cargo's plain and ANSI renderings, each bounded and rejected on
+  truncation or trailing data;
+- the recorded sibling roots of a multi-target command, each with its exact
+  artifact identity, content digest, dep-info, hashed artifact, and
+  fingerprint directory, bounded and rejected on truncation or trailing data.
+  States recorded before sibling roots existed are ordinary misses.
 
 After Cargo succeeds, source capture and indexing run outside the command's
 critical path. The recorder snapshots the exact source baseline, rejects files
