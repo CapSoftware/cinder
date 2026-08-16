@@ -75,9 +75,19 @@ fn run_cargo_inner(
             && env::var_os(crate::run::EXPERIMENTAL_DIRECT_CHECK).as_deref()
                 == Some(OsStr::new("1"));
         if let Some(selection) = crate::run::selected_package(&cargo, &arguments, &run_context) {
+            let recipe_capture = if capture_compiler_recipes {
+                // Witness lookup (and one-time generation) happens only on
+                // this experimental path; a missing witness keeps recipes in
+                // their tracked-subset form.
+                crate::run::RecipeCapture::Enabled {
+                    witness: crate::run::compiler_environment_witness(&cargo),
+                }
+            } else {
+                crate::run::RecipeCapture::Disabled
+            };
             CaptureMode::CargoMessages {
                 selection,
-                capture_compiler_recipes,
+                recipe_capture,
             }
         } else {
             CaptureMode::None
@@ -267,7 +277,7 @@ enum CaptureMode {
     None,
     CargoMessages {
         selection: crate::run::PackageSelection,
-        capture_compiler_recipes: bool,
+        recipe_capture: crate::run::RecipeCapture,
     },
 }
 
@@ -276,11 +286,11 @@ impl CaptureMode {
         match self {
             Self::None => "disabled",
             Self::CargoMessages {
-                capture_compiler_recipes: false,
+                recipe_capture: crate::run::RecipeCapture::Disabled,
                 ..
             } => "messages",
             Self::CargoMessages {
-                capture_compiler_recipes: true,
+                recipe_capture: crate::run::RecipeCapture::Enabled { .. },
                 ..
             } => "messages+compiler-observer",
         }
@@ -295,13 +305,8 @@ fn execute_captured_cargo(
     match capture_mode {
         CaptureMode::CargoMessages {
             selection,
-            capture_compiler_recipes,
-        } => crate::run::run_cargo_messages(
-            command,
-            receipt_directory,
-            selection,
-            *capture_compiler_recipes,
-        ),
+            recipe_capture,
+        } => crate::run::run_cargo_messages(command, receipt_directory, selection, recipe_capture),
         CaptureMode::None => Err("Cargo capture mode was not selected".to_owned()),
     }
 }
