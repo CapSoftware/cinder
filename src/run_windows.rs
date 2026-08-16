@@ -207,3 +207,9 @@ pub fn record_check_state_command(_arguments: Vec<OsString>) -> Result<u8, Strin
 pub fn record_test_state_command(_arguments: Vec<OsString>) -> Result<u8, String> {
     Err("the internal test recorder is unavailable on Windows".to_owned())
 }
+
+/// Windows proxy stub: tuned-toolchain markers are unused because routing is
+/// macOS-only, but the accessor must exist for the shared module.
+pub fn project_state_directory(_directory: &Path) -> PathBuf {
+    std::env::temp_dir().join("cinder").join("windows-unused")
+}

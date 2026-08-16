@@ -834,6 +834,12 @@ fn restored_run_artifact_path(directory: &Path, state: &State) -> Result<PathBuf
     )))
 }
 
+/// Cinder's per-project state directory, exposed for the tuned-toolchain
+/// markers so they live and die with the rest of the project's state.
+pub fn project_state_directory(directory: &Path) -> PathBuf {
+    state_project_directory(directory)
+}
+
 fn restored_run_artifact_receipt_path(directory: &Path, artifact: &Path) -> PathBuf {
     let mut hasher = Sha256::new();
     hasher.update(artifact.as_os_str().as_bytes());
