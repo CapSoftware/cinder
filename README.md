@@ -84,6 +84,44 @@ failure returns the command to stock Cargo automatically. Full per-knob
 attribution, correctness gates, and retained negative results are in the
 [tuned toolchain report](benchmarks/tuned-toolchain/README.md).
 
+## The cross-project unit cache
+
+Dependencies that were already compiled on this machine should never compile
+again — in any project. On macOS, Cinder keeps a machine-local,
+content-addressed cache of registry dependency units: after a successful real
+Cargo build it captures each qualifying unit's rlib, rmeta, dep-info, and
+Cargo's own fingerprint bytes verbatim, and before the next cold build — in
+the same project or any other — it restores proven-identical units into the
+target directory. Cargo then recomputes every fingerprint itself and links a
+restored unit only when its own comparison succeeds, so a wrong or stale
+restore can cost at most a normal recompile, never a wrong reuse.
+
+Units qualify only when the soundness proof showed their bytes are
+project-independent: registry sources, host target, no proc-macro dylibs.
+Build-scripted packages cache as atomic groups — the script's executable,
+its parsed output, and the whole OUT_DIR tree — so a warm cache never
+re-executes a build script it has proven relocatable; a library that reads
+OUT_DIR is itself never cached (its debug info embeds generated-file paths)
+but its script group still restores. A key that ever observes two different
+byte sets is permanently retired. The store lives in the user cache
+directory, is owner-only, bounded to 10 GiB with least-recently-used
+eviction, and is cleared by `cinder clean`.
+
+Measured on warm-cache cold builds (medians, byte-stable artifacts in every
+arm; full protocol, raw arrays, and the per-phase scope comparison in the
+[unit-cache report](benchmarks/unit-cache/README.md)):
+
+| Cold `build` workload | Cargo | Cinder, warm cache | Units restored | Result |
+| --- | ---: | ---: | ---: | ---: |
+| ripgrep | 3.104s | 2.052s | 24 of 33 compiles | **34% faster** |
+| fd | 3.289s | 2.238s | 54 of 58 | **32% faster** |
+| Cinder | 3.215s | 2.293s | 22 of 26 | **29% faster** |
+| Cap example (339-unit graph) | 27.979s | 18.622s | 218 of 339 | **33% faster** |
+
+What still compiles on a warm cache is exactly the evidence-based residue:
+the project's own crates, git-source dependencies, proc-macro dylibs, and
+OUT_DIR-reading libraries.
+
 ## Results
 
 These are median end-to-end timings from real repositories on Apple Silicon.
