@@ -6,7 +6,9 @@ use std::{
     time::Duration,
 };
 
-const CONTROL_ENVIRONMENTS: [&str; 17] = [
+const CONTROL_ENVIRONMENTS: [&str; 19] = [
+    crate::toolchain::STOCK_ENVIRONMENT,
+    crate::toolchain::BACKEND_ENVIRONMENT,
     "CINDER_USAGE",
     "CINDER_EXPERIMENTAL_DIRECT_CHECK",
     "CINDER_TRACE_RUN",

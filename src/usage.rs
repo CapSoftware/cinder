@@ -19,7 +19,9 @@ use fs2::FileExt;
 
 pub const USAGE_ENVIRONMENT: &str = "CINDER_USAGE";
 
-const CONTROL_ENVIRONMENTS: [&str; 17] = [
+const CONTROL_ENVIRONMENTS: [&str; 19] = [
+    crate::toolchain::STOCK_ENVIRONMENT,
+    crate::toolchain::BACKEND_ENVIRONMENT,
     USAGE_ENVIRONMENT,
     "CINDER_EXPERIMENTAL_DIRECT_CHECK",
     "CINDER_TRACE_RUN",
