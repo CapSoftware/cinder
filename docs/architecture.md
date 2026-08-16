@@ -568,6 +568,76 @@ state, compiler receipts, recordings, and target artifacts is namespaced by
 process ID; entries older than one hour are removed only after that process is
 no longer live.
 
+## The cross-project unit cache
+
+On macOS, Cinder keeps a machine-local, content-addressed cache of registry
+dependency units so the same dependency is never compiled twice on one
+machine. Every stored byte is one of Cargo's own build outputs — an rlib,
+rmeta, loose codegen object, dep-info file, or fingerprint-directory file —
+captured verbatim after a successful real Cargo build. Before spawning Cargo
+on a fast-path miss for an eligible `build`, `check`, `run`, or `test`
+command, Cinder speculatively copies matching cached units into the
+destination target directory; Cargo then recomputes every unit's fingerprint
+from actual local inputs and links a restored unit only when that comparison
+independently succeeds. A mis-keyed, stale, or corrupted restore can
+therefore cost at most a normal recompile, never a wrong reuse — the same
+authority boundary every other Cinder fast path preserves.
+
+Units qualify for capture only when the soundness proof
+(`analysis/unit-restore-proof-2026-08-16.md`) showed their bytes are
+project-independent: the fingerprint JSON must match the exact known schema
+with host compilation and a single mtime-mode `CheckDepInfo` local; the
+encoded dep-info must track zero source files (Cargo's own marker for
+immutable registry sources); every dep-info source path must normalize into
+one package directory outside the workspace; and the whole transitive
+dependency closure must itself qualify. Anything else is a silent
+non-capture: proc-macro dylibs (their Mach-O bytes embed project-local
+debug-map paths, a linker UUID, and an ad-hoc code signature), workspace and
+path crates, cross-compiled units, and any unrecognized layout or future
+schema. Project-prefixed text such as the dep-info file is restored through
+a pure prefix substitution proven byte-identical to what Cargo writes
+natively, and a file that cannot be rewritten reversibly skips the unit.
+
+Build-scripted registry packages cache as an atomic group: the build-script
+compile unit (its executable is byte-identical across projects because build
+scripts compile without debug info), the build-script run unit — Cargo's
+parsed `output`, `root-output`, `stderr`, and the entire OUT_DIR tree — and,
+when every group file is provably relocatable, the library unit itself, whose
+`build_script_build` dependency edge is admitted only against its own
+qualified group. Run-unit locals may be `Precalculated` (a silent script on
+an immutable source), `RerunIfChanged` with package-relative paths, or
+`RerunIfEnvChanged`, which Cargo itself revalidates against the live
+environment at planning time; every other shape disqualifies. Relocatability
+is a byte property: a file mentioning the donor workspace outside a donor
+target path, or carrying the donor prefix inside non-UTF-8 content — where a
+substitution could silently corrupt a length-sensitive binary format Cargo
+never fingerprints — excludes the whole package with a persistent,
+reason-carrying marker rather than a retry. A library that reads OUT_DIR
+embeds the generated file's absolute path in its debug info and is therefore
+never cached (verified by a real cross-project divergence); its build-script
+pair still restores standalone, so the script never re-executes and only the
+library's own compilation remains. Restored executables keep their mode;
+groups restore all files or none.
+
+Restores never overwrite an existing destination file, are digest-revalidated
+against per-file SHA-256 records before any byte lands, roll back partial
+writes, and stamp every restored file with one shared modification time so
+Cargo's strictly-newer staleness comparisons cannot misread restore order as
+a rebuild. Entries are keyed by package identity, unit filename hash, and
+Cargo's own total fingerprint hash, and additionally pinned to the producing
+compiler's `-vV` identity and profile; the lockfile bounds which packages are
+even considered. A key that ever observes two different byte sets — for
+example the parallel-frontend tuned toolchain compiling `bstr`
+non-deterministically under load — is permanently marked unstable and never
+cached again, which keeps the byte-faithfulness claim honest per crate rather
+than assuming determinism globally.
+
+The store lives under the user cache directory (`CINDER_UNIT_CACHE`
+overrides it), is versioned, owner-only, bounded to 10 GiB by default with
+least-recently-used eviction (`CINDER_UNIT_CACHE_BYTES` overrides the
+bound), records asynchronously after successful captured builds, and is
+removed entirely by `cinder clean`.
+
 ## The tuned development toolchain
 
 On macOS, Cinder can route eligible development `build`, `check`, `test`, and
