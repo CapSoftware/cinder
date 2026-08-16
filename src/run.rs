@@ -114,7 +114,7 @@ pub use context::run_context;
 pub use context::run_context_with_cargo;
 pub use diagnostics::stage_cargo_invocation;
 pub use envprobe::EnvironmentWitness;
-pub use messages::{PackageSelection, run_cargo_messages, selected_package};
+pub use messages::{PackageSelection, RecipeCapture, run_cargo_messages, selected_package};
 
 use cache::{
     history_directory, history_recency, is_cinder_run_artifact, make_private_directory,

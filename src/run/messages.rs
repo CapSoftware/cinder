@@ -7,8 +7,9 @@
 
 use super::{
     ArtifactReceipt, BTreeMap, BuildScriptOutput, CompilerObserver, CompilerRecipe, OsStr,
-    OsStrExt, OsString, Path, PathBuf, StateKind, env, fs, inputs::primary_dependency_file,
-    make_private_directory, state_project_directory, write_artifact_receipt, write_compiler_recipe,
+    OsStrExt, OsString, Path, PathBuf, StateKind, env, envprobe, envprobe::EnvironmentWitness, fs,
+    inputs::primary_dependency_file, make_private_directory, replay::EnvironmentKind,
+    state_project_directory, write_artifact_receipt, write_compiler_recipe,
 };
 use std::{
     io::{self, BufRead, BufReader, Write},
@@ -453,22 +454,68 @@ fn package_selector(arguments: &[OsString]) -> Option<Option<&OsStr>> {
     Some(selected)
 }
 
+/// How compiler-recipe capture runs for one Cargo invocation.
+pub enum RecipeCapture {
+    Disabled,
+    /// The observer runs; when a witness is present, observed environments
+    /// are validated against it so recipes can carry the complete injected
+    /// set instead of only the tracked subset.
+    Enabled {
+        witness: Option<EnvironmentWitness>,
+    },
+}
+
+impl RecipeCapture {
+    pub(super) fn captures(&self) -> bool {
+        matches!(self, Self::Enabled { .. })
+    }
+
+    fn witness(&self) -> Option<&EnvironmentWitness> {
+        match self {
+            Self::Enabled { witness } => witness.as_ref(),
+            Self::Disabled => None,
+        }
+    }
+}
+
+/// The exact environment the spawned Cargo child inherits: the current
+/// process environment with the command's explicit overrides and removals
+/// applied. The capture path never uses `env_clear`, which `get_envs` cannot
+/// express.
+fn effective_child_environment(command: &Command) -> BTreeMap<OsString, OsString> {
+    let mut environment: BTreeMap<OsString, OsString> = env::vars_os().collect();
+    for (key, value) in command.get_envs() {
+        match value {
+            Some(value) => {
+                environment.insert(key.to_owned(), value.to_owned());
+            }
+            None => {
+                environment.remove(key);
+            }
+        }
+    }
+    environment
+}
+
 /// Runs Cargo while consuming only its documented JSON build messages.
 pub fn run_cargo_messages(
     command: &mut Command,
     receipt_directory: &Path,
     selection: &PackageSelection,
-    capture_compiler_recipes: bool,
+    recipe_capture: &RecipeCapture,
 ) -> Result<ExitStatus, String> {
     fs::write(receipt_directory.join(CAPTURE_ENABLED), b"1")
         .map_err(|error| format!("could not stage Cargo message capture: {error}"))?;
     command.stdout(Stdio::piped());
+    let base_environment = recipe_capture
+        .captures()
+        .then(|| effective_child_environment(command));
     let mut child = command
         .spawn()
         .map_err(|error| format!("could not execute Cargo: {error}"))?;
     let mut observer = Some(CompilerObserver::start(
         child.id(),
-        capture_compiler_recipes,
+        recipe_capture.captures(),
     ));
     let stdout = child
         .stdout
@@ -477,7 +524,13 @@ pub fn run_cargo_messages(
     let mut reader = BufReader::new(stdout);
     let standard_output = io::stdout();
     let mut forwarded = standard_output.lock();
-    let mut capture = MessageCapture::new(receipt_directory, selection, capture_compiler_recipes);
+    let mut capture = MessageCapture::new(
+        receipt_directory,
+        selection,
+        recipe_capture.captures(),
+        recipe_capture.witness(),
+        base_environment,
+    );
     let mut line = Vec::new();
     let mut build_finished = false;
     let stream_result = (|| {
@@ -564,7 +617,13 @@ struct MessageCapture<'a> {
     package_manifests: BTreeMap<String, PathBuf>,
     compiler_recipes: Vec<CompilerRecipe>,
     compiler_replay_blocked: bool,
+    /// A procedural macro executes inside its dependents' compilations and
+    /// can read environment variables no dep-info tracks, so its presence
+    /// restricts recipes to those carrying the complete witnessed set.
+    saw_proc_macro: bool,
     capture_compiler_recipes: bool,
+    witness: Option<&'a EnvironmentWitness>,
+    base_environment: Option<BTreeMap<OsString, OsString>>,
     disabled: bool,
     finished: bool,
 }
@@ -574,6 +633,8 @@ impl<'a> MessageCapture<'a> {
         receipt_directory: &'a Path,
         selection: &'a PackageSelection,
         capture_compiler_recipes: bool,
+        witness: Option<&'a EnvironmentWitness>,
+        base_environment: Option<BTreeMap<OsString, OsString>>,
     ) -> Self {
         Self {
             receipt_directory,
@@ -586,7 +647,10 @@ impl<'a> MessageCapture<'a> {
             package_manifests: BTreeMap::new(),
             compiler_recipes: Vec::new(),
             compiler_replay_blocked: false,
+            saw_proc_macro: false,
             capture_compiler_recipes,
+            witness,
+            base_environment,
             disabled: false,
             finished: false,
         }
@@ -606,7 +670,12 @@ impl<'a> MessageCapture<'a> {
                 if self.capture_compiler_recipes {
                     match string_array(value.get("target").and_then(|target| target.get("kind"))) {
                         Ok(kinds) if kinds.contains(&"proc-macro") => {
-                            self.compiler_replay_blocked = true;
+                            // Not an outright block anymore: a recipe whose
+                            // complete environment was witness-verified is
+                            // still admissible, because the macro executes
+                            // inside that recipe's process and observes
+                            // exactly the restored environment.
+                            self.saw_proc_macro = true;
                         }
                         Ok(_) => {}
                         Err(_) => self.compiler_replay_blocked = true,
@@ -859,6 +928,41 @@ impl<'a> MessageCapture<'a> {
                 };
                 if matching.next().is_none() {
                     let mut recipe = recipe.clone();
+                    if let Some(witness) = self.witness {
+                        if let Some(base) = self.base_environment.as_ref() {
+                            match envprobe::bind_full_environment(
+                                &mut recipe,
+                                witness,
+                                base,
+                                receipt.manifest_directory.as_deref(),
+                                receipt.out_directory.as_deref(),
+                            ) {
+                                Ok(()) => {}
+                                Err(error) => {
+                                    if env::var_os(super::TRACE_RUN).is_some() {
+                                        eprintln!(
+                                            "    Cinder trace: compiler recipe stays tracked ({error})"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // A graph containing a procedural macro admits only
+                    // recipes that restore the complete witnessed
+                    // environment; a tracked subset cannot prove what an
+                    // untracked macro-time read would observe.
+                    if self.saw_proc_macro
+                        && recipe.environment_kind != EnvironmentKind::FullWitnessed
+                    {
+                        if env::var_os(super::TRACE_RUN).is_some() {
+                            eprintln!(
+                                "    Cinder trace: compiler replay requires a witnessed \
+                                 environment for a proc-macro graph"
+                            );
+                        }
+                        continue;
+                    }
                     if recipe
                         .bind_dependency_environment(
                             &receipt.dependency_file,
@@ -1377,7 +1481,7 @@ mod tests {
             cache_path: Some(cache.clone()),
             workspace_root: None,
         };
-        MessageCapture::new(&receipts, &selection, false).finish();
+        MessageCapture::new(&receipts, &selection, false, None, None).finish();
         assert!(!cache.exists());
         assert!(receipts.join(CAPTURE_READY).is_file());
         fs::remove_dir_all(root).unwrap();
@@ -1400,21 +1504,25 @@ mod tests {
             .unwrap()
         };
 
-        let mut procedural_macro = MessageCapture::new(Path::new("."), &selection, true);
+        let mut procedural_macro =
+            MessageCapture::new(Path::new("."), &selection, true, None, None);
         assert!(matches!(
             procedural_macro.observe(&artifact(serde_json::json!(["proc-macro"]))),
             MessageDisposition::Consumed
         ));
-        assert!(procedural_macro.compiler_replay_blocked);
+        // A proc-macro no longer blocks capture outright; it restricts
+        // recipes to witness-verified complete environments.
+        assert!(!procedural_macro.compiler_replay_blocked);
+        assert!(procedural_macro.saw_proc_macro);
 
-        let mut malformed = MessageCapture::new(Path::new("."), &selection, true);
+        let mut malformed = MessageCapture::new(Path::new("."), &selection, true, None, None);
         assert!(matches!(
             malformed.observe(&artifact(serde_json::json!("lib"))),
             MessageDisposition::Consumed
         ));
         assert!(malformed.compiler_replay_blocked);
 
-        let mut ordinary = MessageCapture::new(Path::new("."), &selection, true);
+        let mut ordinary = MessageCapture::new(Path::new("."), &selection, true, None, None);
         assert!(matches!(
             ordinary.observe(&artifact(serde_json::json!(["lib"]))),
             MessageDisposition::Consumed
@@ -1439,7 +1547,7 @@ mod tests {
             .unwrap()
         };
 
-        let mut missing = MessageCapture::new(Path::new("."), &selection, false);
+        let mut missing = MessageCapture::new(Path::new("."), &selection, false, None, None);
         assert!(matches!(
             missing.observe(&message(
                 serde_json::Value::Null,
@@ -1449,14 +1557,14 @@ mod tests {
         ));
         assert!(missing.disabled);
 
-        let mut relative = MessageCapture::new(Path::new("."), &selection, false);
+        let mut relative = MessageCapture::new(Path::new("."), &selection, false, None, None);
         relative.observe(&message(
             serde_json::json!("package"),
             serde_json::json!("out"),
         ));
         assert!(relative.disabled);
 
-        let mut overflowing = MessageCapture::new(Path::new("."), &selection, false);
+        let mut overflowing = MessageCapture::new(Path::new("."), &selection, false, None, None);
         overflowing.build_scripts =
             vec![("package".to_owned(), PathBuf::from("/tmp/out")); MAX_BUILD_SCRIPT_MESSAGES];
         overflowing.observe(&message(
@@ -1502,7 +1610,7 @@ mod tests {
             cache_path: None,
             workspace_root: None,
         };
-        let mut capture = MessageCapture::new(&receipts, &selection, false);
+        let mut capture = MessageCapture::new(&receipts, &selection, false, None, None);
         capture.artifacts = vec![valid, invalid];
         capture.finish();
         assert!(receipts.join(CAPTURE_READY).is_file());
