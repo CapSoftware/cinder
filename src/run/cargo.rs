@@ -565,6 +565,18 @@ pub(super) fn cargo_config_may_change_runner_or_target() -> Result<bool, String>
     })
 }
 
+/// Reports whether configuration could move Cargo's build output somewhere
+/// the unit-cache location resolution does not model: a configured build
+/// target or a redirected target directory.
+pub(super) fn cargo_config_may_move_build_output() -> Result<bool, String> {
+    cargo_config_may_change(|config| {
+        config
+            .get("build")
+            .and_then(toml::Value::as_table)
+            .is_some_and(|build| build.contains_key("target") || build.contains_key("target-dir"))
+    })
+}
+
 /// Reports whether the user pinned Cargo's color choice through configuration.
 /// A pinned value renders identically on every stderr, so one recorded
 /// diagnostic variant is exact; `auto` and unset depend on the live terminal.
