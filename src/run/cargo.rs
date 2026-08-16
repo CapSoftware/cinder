@@ -565,6 +565,20 @@ pub(super) fn cargo_config_may_change_runner_or_target() -> Result<bool, String>
     })
 }
 
+/// Reports whether the user pinned Cargo's color choice through configuration.
+/// A pinned value renders identically on every stderr, so one recorded
+/// diagnostic variant is exact; `auto` and unset depend on the live terminal.
+pub(super) fn cargo_config_pins_term_color() -> Result<bool, String> {
+    cargo_config_may_change(|config| {
+        config
+            .get("term")
+            .and_then(toml::Value::as_table)
+            .and_then(|term| term.get("color"))
+            .and_then(toml::Value::as_str)
+            .is_some_and(|color| color != "auto")
+    })
+}
+
 fn cargo_config_may_set_rustc_wrapper() -> Result<bool, String> {
     cargo_config_may_change(|config| {
         config
