@@ -57,9 +57,24 @@ pub fn run_cargo(
     if env::var_os(crate::run::TRACE_RUN).is_some() {
         eprintln!("    Cinder trace: Cargo capture={}", capture_mode.name());
     }
-    let receipt_directory = (!matches!(capture_mode, CaptureMode::None))
+    let mut capture_mode = capture_mode;
+    let mut receipt_directory = (!matches!(capture_mode, CaptureMode::None))
         .then(crate::run::stage_artifact_receipts)
         .transpose()?;
+    // The staged invocation lets the recorder prove the diagnostic replay.
+    // An unstageable invocation only disables capture; the user's Cargo
+    // command must still run exactly as requested.
+    if let Some(directory) = receipt_directory.as_deref() {
+        if let Err(error) = crate::run::stage_cargo_invocation(directory, &cargo, &arguments) {
+            if env::var_os(crate::run::TRACE_RUN).is_some() {
+                eprintln!("    Cinder trace: Cargo capture disabled ({error})");
+            }
+            let _ = std::fs::remove_dir_all(directory);
+            receipt_directory = None;
+            capture_mode = CaptureMode::None;
+        }
+    }
+    let capture_mode = capture_mode;
     let test_execution = matches!(subcommand, Some("test" | "t"))
         && crate::run::test_execution_eligible(&arguments)?;
     let context_path = if receipt_directory.is_some() {

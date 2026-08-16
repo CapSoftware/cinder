@@ -80,6 +80,14 @@ pub fn stage_artifact_receipts() -> Result<PathBuf, String> {
     Err("artifact capture is disabled on Windows".to_owned())
 }
 
+pub fn stage_cargo_invocation(
+    _receipt_directory: &Path,
+    _cargo: &Path,
+    _arguments: &[OsString],
+) -> Result<(), String> {
+    Err("artifact capture is disabled on Windows".to_owned())
+}
+
 pub fn stage_run_context(_context: &[u8]) -> Result<PathBuf, String> {
     Err("fast run is disabled on Windows".to_owned())
 }
