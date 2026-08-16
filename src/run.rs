@@ -122,19 +122,26 @@ use cache::{
 };
 use capture::cargo_subcommand_index;
 use cargo::{
-    build_eligible, canonical_current_directory, check_eligible, eligible, host_target,
-    manifest_has_standard_library_test_harness_at, test_eligible, test_executes, toml_string,
+    build_eligible, canonical_current_directory, cargo_config_pins_term_color, check_eligible,
+    eligible, host_target, manifest_has_standard_library_test_harness_at, test_eligible,
+    test_executes, toml_string,
 };
 use context::{append_context_value, bind_observed_shell_environment, compiler_unit_graph};
+use diagnostics::{
+    DiagnosticsReplay, capture_replay_diagnostics, read_cargo_invocation, read_diagnostics,
+    write_diagnostics,
+};
 use inputs::{
-    BuildInputGraph, RUNTIME_LINKER_ENVIRONMENT_KEYS, artifact_file_identity,
+    BuildInputGraph, RUNTIME_LINKER_ENVIRONMENT_KEYS, StateReader, artifact_file_identity,
     artifact_file_identity_from_metadata, artifact_identity, artifact_metadata, build_inputs,
     build_source_paths, cargo_outputs_for_artifact, cargo_profile_directory,
     dependency_output_paths, input_entries_are_unchanged, input_entries_match_revision,
-    package_may_have_build_script, project_may_have_build_script, project_topology_and_inputs,
-    project_topology_is_unchanged, read_cargo_outputs, read_inputs, read_project_topology,
-    read_runtime_environment, read_source_paths, runtime_linker_environment, write_cargo_outputs,
-    write_inputs, write_project_topology, write_runtime_environment, write_source_paths,
+    input_identity, package_may_have_build_script, project_may_have_build_script,
+    project_topology_and_inputs, project_topology_is_unchanged, read_bounded_state,
+    read_cargo_outputs, read_inputs, read_project_topology, read_runtime_environment,
+    read_sibling_roots, read_source_paths, runtime_linker_environment, write_cargo_outputs,
+    write_inputs, write_project_topology, write_runtime_environment, write_sibling_roots,
+    write_source_paths, write_state_bytes,
 };
 use observe::CompilerObserver;
 use patch::{
@@ -148,8 +155,8 @@ use source::{
 };
 use state::{
     ArtifactFileIdentity, ArtifactReceipt, BuildScriptOutput, CargoOutputEntry, CargoOutputs,
-    InputEntry, LiteralIndexEntry, ProjectTopology, State, TopologyDirectory,
-    read_artifact_receipt, write_artifact_receipt,
+    InputEntry, LiteralIndexEntry, MAX_STATE_ROOTS, ProjectTopology, SiblingRoot, SourceRecord,
+    State, TopologyDirectory, read_artifact_receipt, write_artifact_receipt,
 };
 
 /// Attempts a source-to-artifact transformation before asking Cargo to build.
@@ -171,9 +178,19 @@ pub fn try_fast_run(
     let mut history_probes = HistoryProbeCache::default();
     let current = State::load(&directory, StateKind::Run)?;
     if let Some(state) = current.as_ref().filter(|state| {
-        state.context_matches(run_context) && state.artifact_is_unchanged().unwrap_or(false)
+        state.context_matches(run_context)
+            && state.sibling_roots.is_empty()
+            && state.artifact_is_unchanged().unwrap_or(false)
     }) {
-        if let Some(change) = find_literal_change(&directory, &state.snapshot, &state.sources)? {
+        // A patch produces source Cargo never rendered diagnostics for, so
+        // recorded warnings disqualify the transformation rather than being
+        // replayed inexactly.
+        let change = if state.diagnostics.is_none() {
+            find_literal_change(&directory, &state.snapshot, &state.sources)?
+        } else {
+            None
+        };
+        if let Some(change) = change {
             if cargo_outputs_and_inputs_are_unchanged(state, &directory)? {
                 if let Some(patched) =
                     patch_artifact(&directory, state, &change, PatchMode::RunSibling)?
@@ -217,6 +234,7 @@ pub fn try_fast_run(
                     crate::usage::Outcome::CurrentReuse,
                     decision_started.elapsed(),
                 );
+                state.diagnostics.replay_to_stderr();
                 eprintln!("    Cinder reusing {}", state.artifact.display());
                 return exec_artifact(
                     &state.artifact,
@@ -251,6 +269,7 @@ pub fn try_fast_run(
         crate::usage::Outcome::RevisionRestore,
         decision_started.elapsed(),
     );
+    historical.diagnostics.replay_to_stderr();
     eprintln!(
         "    Cinder restored a validated previous build of {} without recompiling",
         historical.program_name.to_string_lossy()
@@ -346,7 +365,7 @@ pub fn try_fast_check(arguments: &[OsString], check_context: &[u8]) -> Result<bo
         return Ok(false);
     }
     let stage_started = Instant::now();
-    if !state.artifact_is_unchanged()? {
+    if !state.artifact_is_unchanged()? || !state.sibling_roots_are_unchanged()? {
         return Ok(false);
     }
     patch::trace_run("validate selected check artifact", stage_started);
@@ -354,8 +373,12 @@ pub fn try_fast_check(arguments: &[OsString], check_context: &[u8]) -> Result<bo
     let sources_match = state.sources_match_revision(&directory)?;
     patch::trace_run("validate selected check sources", stage_started);
     if !sources_match {
+        // A recorded diagnostic replay describes the previous source revision;
+        // a changed source could render differently, so replays stay on Cargo.
         if env::var_os(EXPERIMENTAL_DIRECT_CHECK).as_deref() != Some(OsStr::new("1"))
             || !state.compiler_recipe_supports_direct_check()
+            || !state.diagnostics.is_none()
+            || !state.sibling_roots.is_empty()
         {
             if env::var_os(TRACE_RUN).is_some() {
                 eprintln!(
@@ -406,10 +429,18 @@ pub fn try_fast_check(arguments: &[OsString], check_context: &[u8]) -> Result<bo
         crate::usage::Outcome::CurrentReuse,
         decision_started.elapsed(),
     );
-    eprintln!(
-        "    Cinder reused the validated check of {} without invoking Cargo",
-        state.artifact.display()
-    );
+    state.diagnostics.replay_to_stderr();
+    if state.sibling_roots.is_empty() {
+        eprintln!(
+            "    Cinder reused the validated check of {} without invoking Cargo",
+            state.artifact.display()
+        );
+    } else {
+        eprintln!(
+            "    Cinder reused the validated check of {} targets without invoking Cargo",
+            state.sibling_roots.len() + 1
+        );
+    }
     Ok(true)
 }
 
@@ -469,6 +500,7 @@ pub fn try_fast_test(arguments: &[OsString], test_context: &[u8]) -> Result<Opti
             crate::usage::Outcome::CurrentReuse,
             decision_started.elapsed(),
         );
+        state.diagnostics.replay_to_stderr();
         eprintln!(
             "    Cinder running the validated test executable {} without invoking Cargo",
             state.artifact.display()
@@ -486,6 +518,7 @@ pub fn try_fast_test(arguments: &[OsString], test_context: &[u8]) -> Result<Opti
             crate::usage::Outcome::CurrentReuse,
             decision_started.elapsed(),
         );
+        state.diagnostics.replay_to_stderr();
         eprintln!(
             "    Cinder reused the validated test build of {} without invoking Cargo",
             state.artifact.display()
@@ -552,7 +585,14 @@ fn try_fast_build_locked(
             && state.artifact_is_unchanged().unwrap_or(false)
     }) {
         let stage_started = Instant::now();
-        let change = if artifact_is_executable(&state.public_artifact) {
+        // A patch produces source Cargo never rendered diagnostics for, so
+        // recorded warnings disqualify the transformation rather than being
+        // replayed inexactly. Patching also stays single-root: a multi-target
+        // command would need every sibling artifact patched coherently.
+        let change = if state.diagnostics.is_none()
+            && state.sibling_roots.is_empty()
+            && artifact_is_executable(&state.public_artifact)
+        {
             find_literal_change(directory, &state.snapshot, &state.sources)?
         } else {
             None
@@ -584,6 +624,7 @@ fn try_fast_build_locked(
             patch::trace_run("validate current build sources", stage_started);
             let inputs_unchanged = if sources_unchanged {
                 cargo_outputs_and_inputs_are_unchanged(&state, directory)?
+                    && state.sibling_roots_are_unchanged()?
             } else {
                 false
             };
@@ -598,10 +639,18 @@ fn try_fast_build_locked(
                     crate::usage::Outcome::CurrentReuse,
                     decision_started.elapsed(),
                 );
-                eprintln!(
-                    "    Cinder reused {} without invoking Cargo",
-                    state.artifact.display()
-                );
+                state.diagnostics.replay_to_stderr();
+                if state.sibling_roots.is_empty() {
+                    eprintln!(
+                        "    Cinder reused {} without invoking Cargo",
+                        state.artifact.display()
+                    );
+                } else {
+                    eprintln!(
+                        "    Cinder reused the validated build of {} targets without invoking Cargo",
+                        state.sibling_roots.len() + 1
+                    );
+                }
                 return Ok(true);
             }
         }
@@ -626,6 +675,7 @@ fn try_fast_build_locked(
         crate::usage::Outcome::RevisionRestore,
         decision_started.elapsed(),
     );
+    historical.diagnostics.replay_to_stderr();
     eprintln!(
         "    Cinder restored a validated previous build of {} without invoking Cargo",
         restored.display()
@@ -1066,6 +1116,12 @@ fn schedule_test_execution_state(
             .transpose()?
             .flatten()
             .ok_or_else(|| "Cargo produced no exact test artifact receipt".to_owned())?;
+        let diagnostics = receipt_directory
+            .as_deref()
+            .map(|receipts| {
+                captured_receipt_diagnostics(receipts, StateKind::Test, artifact, directory)
+            })
+            .transpose()?;
         let result = State::record_fresh_test_execution(
             directory,
             artifact,
@@ -1073,6 +1129,7 @@ fn schedule_test_execution_state(
             test_context,
             &receipt,
             runtime_directory,
+            diagnostics,
         );
         if let Some(directory) = receipt_directory {
             let _ = fs::remove_dir_all(directory);
@@ -1135,6 +1192,12 @@ pub fn record_test_execution_state_command(arguments: &[OsString]) -> Result<u8,
         .transpose()?
         .flatten()
         .ok_or_else(|| "Cargo produced no exact test artifact receipt".to_owned())?;
+    let diagnostics = receipt_directory
+        .as_deref()
+        .map(|receipts| {
+            captured_receipt_diagnostics(receipts, StateKind::Test, Path::new(artifact), &directory)
+        })
+        .transpose()?;
     let result = State::record_fresh_test_execution(
         &directory,
         Path::new(artifact),
@@ -1142,6 +1205,7 @@ pub fn record_test_execution_state_command(arguments: &[OsString]) -> Result<u8,
         &context,
         &receipt,
         Path::new(runtime_directory),
+        diagnostics,
     );
     let _ = fs::remove_file(context_path);
     if let Some(directory) = receipt_directory {
@@ -1156,13 +1220,20 @@ fn schedule_run_state(
     program_name: &OsStr,
     run_context: &[u8],
     receipt_directory: Option<PathBuf>,
+    synchronous: bool,
 ) -> Result<(), String> {
-    if env::var_os(SYNCHRONOUS_STATE_RECORDING).is_some() {
+    if synchronous {
         let receipt = receipt_directory
             .as_deref()
             .map(|directory| matching_artifact_receipt(directory, artifact))
             .transpose()?
             .flatten();
+        let diagnostics = receipt_directory
+            .as_deref()
+            .map(|receipts| {
+                captured_receipt_diagnostics(receipts, StateKind::Run, artifact, directory)
+            })
+            .transpose()?;
         let result = State::record_fresh(
             directory,
             StateKind::Run,
@@ -1170,6 +1241,7 @@ fn schedule_run_state(
             program_name,
             run_context,
             receipt.as_ref(),
+            diagnostics,
         );
         if let Some(directory) = receipt_directory {
             let _ = fs::remove_dir_all(directory);
@@ -1227,6 +1299,12 @@ pub fn record_run_state_command(arguments: &[OsString]) -> Result<u8, String> {
         .map(|directory| matching_artifact_receipt(directory, Path::new(artifact)))
         .transpose()?
         .flatten();
+    let diagnostics = receipt_directory
+        .as_deref()
+        .map(|receipts| {
+            captured_receipt_diagnostics(receipts, StateKind::Run, Path::new(artifact), &directory)
+        })
+        .transpose()?;
     let result = State::record_fresh(
         &directory,
         StateKind::Run,
@@ -1234,6 +1312,7 @@ pub fn record_run_state_command(arguments: &[OsString]) -> Result<u8, String> {
         program_name,
         &context,
         receipt.as_ref(),
+        diagnostics,
     );
     let _ = fs::remove_file(context_path);
     if let Some(directory) = receipt_directory {
@@ -1284,12 +1363,71 @@ fn matching_test_artifact_receipt(
     }
 }
 
+/// Reads the staged Cargo invocation and runs the hidden diagnostic replay
+/// passes for a freshly recorded command. Before any Cargo child is spawned,
+/// every source consumed by the staged receipts must predate the staged
+/// invocation file, which was written before the recorded command's own Cargo
+/// child: a newer source means the user kept editing after the command, and a
+/// "no-change" pass would start a real, unrequested background compile.
+fn captured_receipt_diagnostics(
+    receipts: &Path,
+    kind: StateKind,
+    artifact: &Path,
+    directory: &Path,
+) -> Result<DiagnosticsReplay, String> {
+    let (cargo, original_arguments) = read_cargo_invocation(receipts)?;
+    let (_, staged_ns) = artifact_metadata(&receipts.join("cargo-invocation"))?;
+    for receipt in read_artifact_receipts(receipts)? {
+        // The receipt's artifact path may be relative; the target-directory
+        // filter that excludes build-script-generated files needs it absolute.
+        let receipt_artifact = absolute_path(&receipt.artifact)?;
+        let dependency_file = absolute_path(&receipt.dependency_file)?;
+        for source in build_source_paths(directory, &receipt_artifact, &dependency_file)? {
+            let (_, modified_ns) = artifact_metadata(&directory.join(&source))?;
+            if modified_ns > staged_ns {
+                return Err(format!(
+                    "{} changed after the Cargo command started; diagnostic replay abandoned",
+                    source.display()
+                ));
+            }
+        }
+    }
+    capture_replay_diagnostics(&cargo, &original_arguments, kind, artifact)
+}
+
+/// A multi-root recording must cover every selected unit Cargo built. A unit
+/// dropped from the receipt set for any reason other than being a build
+/// script (a procedural macro, a multi-crate-type target, an unknown layout)
+/// would let a later reuse hit report success for a unit it never validated.
+/// An explicit single-target selector keeps today's behavior: its reuse
+/// validates the selected root's complete reachable graph.
+fn receipt_set_is_complete(receipt_directory: &Path, selects_executable: bool) -> bool {
+    match messages::read_receipt_gaps(receipt_directory) {
+        Some(0) => true,
+        Some(gaps) => {
+            if !selects_executable && env::var_os(TRACE_RUN).is_some() {
+                eprintln!("    Cinder trace: {gaps} selected units have no receipt");
+            }
+            selects_executable
+        }
+        None => {
+            if env::var_os(TRACE_RUN).is_some() {
+                eprintln!("    Cinder trace: the receipt gap marker is missing or malformed");
+            }
+            false
+        }
+    }
+}
+
 pub fn record_completed_build(
     receipt_directory: &Path,
     build_context: &[u8],
     selects_executable: bool,
 ) -> Result<bool, String> {
     let result = (|| {
+        if !receipt_set_is_complete(receipt_directory, selects_executable) {
+            return Ok(false);
+        }
         let receipts = read_artifact_receipts(receipt_directory)?;
         let mut artifacts = BTreeMap::<PathBuf, ArtifactReceipt>::new();
         for receipt in receipts {
@@ -1299,31 +1437,60 @@ pub fn record_completed_build(
             let artifact = public_artifact(&receipt)?;
             artifacts.entry(artifact).or_insert(receipt);
         }
-        if artifacts.len() != 1 {
+        // A selector shape still requires exactly one executable; the default
+        // target set may record every selected public artifact. Proc-macro
+        // units are accepted as check roots only: build-mode publication and
+        // promotion reason about public executables and libraries, so a
+        // proc-macro root keeps build recording refused exactly as the
+        // receipt-gap rule did before these units converted.
+        if artifacts.is_empty()
+            || artifacts.len() > MAX_STATE_ROOTS
+            || (selects_executable && artifacts.len() != 1)
+            || artifacts
+                .values()
+                .any(|receipt| receipt.crate_type == "proc-macro")
+        {
             if env::var_os(TRACE_RUN).is_some() {
                 eprintln!(
-                    "    Cinder trace: expected one executable receipt, found {}",
+                    "    Cinder trace: unsupported executable receipt count {}",
                     artifacts.len()
                 );
             }
             return Ok(false);
         }
-        let (artifact, receipt) = artifacts
-            .into_iter()
-            .next()
-            .ok_or_else(|| "primary executable disappeared from build state".to_owned())?;
+        let roots: Vec<(PathBuf, ArtifactReceipt)> = artifacts.into_iter().collect();
         let directory = canonical_current_directory()?;
-        let program_name = artifact
-            .file_name()
-            .ok_or_else(|| format!("Cargo artifact has no file name: {}", artifact.display()))?;
-        State::record_fresh(
-            &directory,
+        let diagnostics = captured_receipt_diagnostics(
+            receipt_directory,
             StateKind::Build,
-            &artifact,
-            program_name,
-            build_context,
-            Some(&receipt),
+            &roots[0].0,
+            &directory,
         )?;
+        if let [(artifact, receipt)] = roots.as_slice() {
+            let program_name = artifact.file_name().ok_or_else(|| {
+                format!("Cargo artifact has no file name: {}", artifact.display())
+            })?;
+            State::record_fresh(
+                &directory,
+                StateKind::Build,
+                artifact,
+                program_name,
+                build_context,
+                Some(receipt),
+                Some(diagnostics),
+            )?;
+        } else {
+            let (_, command_started_ns) =
+                artifact_metadata(&receipt_directory.join("cargo-invocation"))?;
+            State::record_fresh_multi(
+                &directory,
+                StateKind::Build,
+                &roots,
+                build_context,
+                diagnostics,
+                command_started_ns,
+            )?;
+        }
         Ok(true)
     })();
     let _ = fs::remove_dir_all(receipt_directory);
@@ -1336,6 +1503,9 @@ pub fn record_completed_check(
     selects_executable: bool,
 ) -> Result<bool, String> {
     let result = (|| {
+        if !receipt_set_is_complete(receipt_directory, selects_executable) {
+            return Ok(false);
+        }
         let receipts = read_artifact_receipts(receipt_directory)?;
         let mut artifacts = BTreeMap::<PathBuf, ArtifactReceipt>::new();
         for receipt in receipts {
@@ -1344,34 +1514,55 @@ pub fn record_completed_check(
             }
             artifacts.entry(receipt.artifact.clone()).or_insert(receipt);
         }
-        if artifacts.len() != 1 {
+        if artifacts.is_empty() || artifacts.len() > MAX_STATE_ROOTS {
             if env::var_os(TRACE_RUN).is_some() {
                 eprintln!(
-                    "    Cinder trace: expected one check receipt, found {}",
+                    "    Cinder trace: expected 1..={MAX_STATE_ROOTS} check receipts, found {}",
                     artifacts.len()
                 );
             }
             return Ok(false);
         }
-        let (artifact, receipt) = artifacts
-            .into_iter()
-            .next()
-            .ok_or_else(|| "primary check artifact disappeared from state".to_owned())?;
+        // BTreeMap iteration keeps the roots in lexicographic artifact order,
+        // so the first root is the deterministic primary.
+        let roots: Vec<(PathBuf, ArtifactReceipt)> = artifacts.into_iter().collect();
         let directory = canonical_current_directory()?;
-        let program_name = artifact.file_name().ok_or_else(|| {
-            format!(
-                "Cargo check artifact has no file name: {}",
-                artifact.display()
-            )
-        })?;
-        State::record_fresh(
-            &directory,
+        let diagnostics = captured_receipt_diagnostics(
+            receipt_directory,
             StateKind::Check,
-            &artifact,
-            program_name,
-            check_context,
-            Some(&receipt),
+            &roots[0].0,
+            &directory,
         )?;
+        if let [(artifact, receipt)] = roots.as_slice() {
+            let program_name = artifact.file_name().ok_or_else(|| {
+                format!(
+                    "Cargo check artifact has no file name: {}",
+                    artifact.display()
+                )
+            })?;
+            State::record_fresh(
+                &directory,
+                StateKind::Check,
+                artifact,
+                program_name,
+                check_context,
+                Some(receipt),
+                Some(diagnostics),
+            )?;
+        } else {
+            // The staged invocation was written before the Cargo child
+            // spawned; its timestamp bounds mid-command source edits.
+            let (_, command_started_ns) =
+                artifact_metadata(&receipt_directory.join("cargo-invocation"))?;
+            State::record_fresh_multi(
+                &directory,
+                StateKind::Check,
+                &roots,
+                check_context,
+                diagnostics,
+                command_started_ns,
+            )?;
+        }
         Ok(true)
     })();
     let _ = fs::remove_dir_all(receipt_directory);
@@ -1411,6 +1602,12 @@ pub fn record_completed_test(
                 artifact.display()
             )
         })?;
+        let diagnostics = captured_receipt_diagnostics(
+            receipt_directory,
+            StateKind::Test,
+            &artifact,
+            &directory,
+        )?;
         State::record_fresh(
             &directory,
             StateKind::Test,
@@ -1418,6 +1615,7 @@ pub fn record_completed_test(
             program_name,
             test_context,
             Some(&receipt),
+            Some(diagnostics),
         )?;
         Ok(true)
     })();
