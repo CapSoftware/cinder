@@ -224,18 +224,18 @@ const MAX_INPUT_STATE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_INPUT_ENTRIES: usize = 1_000_000;
 const MAX_INPUT_PATH_BYTES: usize = 1024 * 1024;
 
-struct StateReader<'a> {
+pub(super) struct StateReader<'a> {
     remaining: &'a [u8],
 }
 
 impl<'a> StateReader<'a> {
-    const fn new(contents: &'a [u8]) -> Self {
+    pub(super) const fn new(contents: &'a [u8]) -> Self {
         Self {
             remaining: contents,
         }
     }
 
-    fn take(&mut self, length: usize, label: &str) -> Result<&'a [u8], String> {
+    pub(super) fn take(&mut self, length: usize, label: &str) -> Result<&'a [u8], String> {
         if self.remaining.len() < length {
             return Err(format!("could not read {label}: state is truncated"));
         }
@@ -244,13 +244,17 @@ impl<'a> StateReader<'a> {
         Ok(value)
     }
 
-    fn array<const N: usize>(&mut self, label: &str) -> Result<[u8; N], String> {
+    pub(super) fn array<const N: usize>(&mut self, label: &str) -> Result<[u8; N], String> {
         self.take(N, label)?
             .try_into()
             .map_err(|_| format!("could not read {label}: state is truncated"))
     }
 
-    fn length_prefixed(&mut self, maximum: usize, label: &str) -> Result<&'a [u8], String> {
+    pub(super) fn length_prefixed(
+        &mut self,
+        maximum: usize,
+        label: &str,
+    ) -> Result<&'a [u8], String> {
         let length = u32::from_le_bytes(self.array(label)?) as usize;
         if length > maximum {
             return Err(format!("Cinder {label} is too long"));
@@ -258,7 +262,7 @@ impl<'a> StateReader<'a> {
         self.take(length, label)
     }
 
-    fn finish(self, label: &str) -> Result<(), String> {
+    pub(super) fn finish(self, label: &str) -> Result<(), String> {
         if self.remaining.is_empty() {
             Ok(())
         } else {
@@ -267,7 +271,11 @@ impl<'a> StateReader<'a> {
     }
 }
 
-fn read_bounded_state(path: &Path, maximum: u64, label: &str) -> Result<Vec<u8>, String> {
+pub(super) fn read_bounded_state(
+    path: &Path,
+    maximum: u64,
+    label: &str,
+) -> Result<Vec<u8>, String> {
     let file = fs::File::open(path).map_err(|error| format!("could not open {label}: {error}"))?;
     let size = file
         .metadata()
@@ -298,6 +306,23 @@ fn read_file_identity(
         changed_seconds: i64::from_le_bytes(reader.array(label)?),
         changed_nanoseconds: i64::from_le_bytes(reader.array(label)?),
     })
+}
+
+/// Serializes the six identity fields in exactly the order `read_file_identity`
+/// decodes them, followed by nothing; callers append their digest separately.
+pub(super) fn write_file_identity(
+    writer: &mut impl Write,
+    identity: &ArtifactFileIdentity,
+    label: &str,
+) -> Result<(), String> {
+    writer
+        .write_all(&identity.size.to_le_bytes())
+        .and_then(|()| writer.write_all(&identity.modified_ns.to_le_bytes()))
+        .and_then(|()| writer.write_all(&identity.device.to_le_bytes()))
+        .and_then(|()| writer.write_all(&identity.inode.to_le_bytes()))
+        .and_then(|()| writer.write_all(&identity.changed_seconds.to_le_bytes()))
+        .and_then(|()| writer.write_all(&identity.changed_nanoseconds.to_le_bytes()))
+        .map_err(|error| format!("could not write Cinder {label}: {error}"))
 }
 
 pub(super) struct BuildInputGraph<'a> {
@@ -1899,7 +1924,7 @@ pub(super) fn write_runtime_environment(
 }
 
 pub(super) fn write_state_bytes(
-    file: &mut fs::File,
+    file: &mut impl Write,
     value: &[u8],
     label: &str,
 ) -> Result<(), String> {
