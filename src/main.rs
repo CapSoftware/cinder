@@ -74,6 +74,9 @@ fn run(arguments: Vec<OsString>, launch_policy: run::LaunchPolicy) -> Result<u8,
         Some("__record-test") => {
             run::record_test_state_command(arguments.into_iter().skip(1).collect())
         }
+        Some("__record-units") => {
+            run::record_units_command(arguments.into_iter().skip(1).collect())
+        }
         Some(_) => command::run_cargo(arguments, launch_policy),
     }
 }
