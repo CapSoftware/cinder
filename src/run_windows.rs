@@ -226,6 +226,18 @@ pub fn record_check_state_command(_arguments: Vec<OsString>) -> Result<u8, Strin
     Err("the internal check recorder is unavailable on Windows".to_owned())
 }
 
+pub fn restore_cached_units(_arguments: &[OsString]) {}
+
+pub fn schedule_unit_record(_arguments: &[OsString]) {}
+
+pub fn record_units_command(_arguments: Vec<OsString>) -> Result<u8, String> {
+    Ok(0)
+}
+
+pub fn clear_unit_cache() -> Result<(), String> {
+    Ok(())
+}
+
 pub fn record_test_state_command(_arguments: Vec<OsString>) -> Result<u8, String> {
     Err("the internal test recorder is unavailable on Windows".to_owned())
 }
